@@ -7,7 +7,30 @@ app.use(cors());
 app.use(express.json());
 
 const portfolioRoutes = require("./routes/portfolio");
-app.use("/api/portfolio", portfolioRoutes);
+
+function requireDashboardToken(req, res, next) {
+  const expectedToken = process.env.PUBLIC_DASHBOARD_TOKEN;
+
+  if (!expectedToken) {
+    return res.status(500).json({
+      error: "PUBLIC_DASHBOARD_TOKEN is not configured"
+    });
+  }
+
+  const providedToken =
+    req.query.token ||
+    req.headers["x-dashboard-token"];
+
+  if (providedToken !== expectedToken) {
+    return res.status(401).json({
+      error: "Unauthorized"
+    });
+  }
+
+  next();
+}
+
+app.use("/api/portfolio", requireDashboardToken, portfolioRoutes);
 
 app.get("/", (req, res) => {
   res.json({ status: "wealth-os online" });
