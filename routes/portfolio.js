@@ -2,7 +2,7 @@ const router = require("express").Router();
 const axios = require("axios");
 const db = require("../db");
 
-const ENGINE_VERSION = "price-engine-v1.1-manual-fallback";
+const ENGINE_VERSION = "price-engine-v1.2-portfolio-watchlist";
 
 const MARKET_CACHE = new Map();
 const CACHE_TTL_MS = 5 * 60 * 1000;
@@ -252,6 +252,52 @@ function applyManualFallback(asset, market) {
   };
 }
 
+function getMarketDirection(dayChangeValue, dayChangePercent) {
+  const value = toNumberOrNull(dayChangeValue);
+  const percent = toNumberOrNull(dayChangePercent);
+
+  const signal = value !== null ? value : percent;
+
+  if (signal === null) return "unknown";
+  if (signal > 0) return "up";
+  if (signal < 0) return "down";
+  return "flat";
+}
+
+function getDisplayColor(mode, marketDirection) {
+  if (marketDirection === "unknown" || marketDirection === "flat") {
+    return "neutral";
+  }
+
+  if (mode === "watchlist") {
+    return marketDirection === "down" ? "green" : "red";
+  }
+
+  return marketDirection === "up" ? "green" : "red";
+}
+
+function summarizeAssets(assets) {
+  const totalValue = assets.reduce((sum, asset) => {
+    return sum + (asset.value || 0);
+  }, 0);
+
+  const totalDayChangeValue = assets.reduce((sum, asset) => {
+    return sum + (asset.day_change_value || 0);
+  }, 0);
+
+  const totalDayChangePercent =
+    totalValue > 0 && totalValue - totalDayChangeValue !== 0
+      ? (totalDayChangeValue / (totalValue - totalDayChangeValue)) * 100
+      : null;
+
+  return {
+    total_value: round(totalValue, 2),
+    total_day_change_value: round(totalDayChangeValue, 2),
+    total_day_change_percent: round(totalDayChangePercent, 4),
+    assets
+  };
+}
+
 router.get("/", async (req, res) => {
   try {
     const userId = req.query.user_id || 1;
@@ -264,6 +310,7 @@ router.get("/", async (req, res) => {
     const enrichedAssets = await Promise.all(
       result.rows.map(async (asset) => {
         const quantity = quantityToNumber(asset.quantity);
+        const mode = asset.mode === "watchlist" ? "watchlist" : "portfolio";
 
         const externalMarket = await getMarketData(asset);
         const market = applyManualFallback(asset, externalMarket);
@@ -286,9 +333,17 @@ router.get("/", async (req, res) => {
           dayChangeValue = value * (market.day_change_percent / 100);
         }
 
+        const roundedDayChangeValue = round(dayChangeValue, 2);
+        const roundedDayChangePercent = round(market.day_change_percent, 4);
+        const marketDirection = getMarketDirection(
+          roundedDayChangeValue,
+          roundedDayChangePercent
+        );
+
         return {
           id: asset.id,
           user_id: asset.user_id,
+          mode,
           name: asset.name,
           type: asset.type,
           symbol: asset.symbol,
@@ -302,8 +357,11 @@ router.get("/", async (req, res) => {
           price: round(price, 4),
           value: round(value, 2),
           day_change_abs: round(market.day_change_abs, 4),
-          day_change_percent: round(market.day_change_percent, 4),
-          day_change_value: round(dayChangeValue, 2),
+          day_change_percent: roundedDayChangePercent,
+          day_change_value: roundedDayChangeValue,
+
+          market_direction: marketDirection,
+          display_color: getDisplayColor(mode, marketDirection),
 
           source: market.source,
           source_error: market.source_error || null,
@@ -313,26 +371,29 @@ router.get("/", async (req, res) => {
       })
     );
 
-    const totalValue = enrichedAssets.reduce((sum, asset) => {
-      return sum + (asset.value || 0);
-    }, 0);
+    const portfolioAssets = enrichedAssets.filter(
+      (asset) => asset.mode === "portfolio"
+    );
 
-    const totalDayChangeValue = enrichedAssets.reduce((sum, asset) => {
-      return sum + (asset.day_change_value || 0);
-    }, 0);
+    const watchlistAssets = enrichedAssets.filter(
+      (asset) => asset.mode === "watchlist"
+    );
 
-    const totalDayChangePercent =
-      totalValue > 0 && totalValue - totalDayChangeValue !== 0
-        ? (totalDayChangeValue / (totalValue - totalDayChangeValue)) * 100
-        : null;
+    const portfolio = summarizeAssets(portfolioAssets);
+    const watchlist = summarizeAssets(watchlistAssets);
 
     res.json({
       engine_version: ENGINE_VERSION,
       user_id: Number(userId),
       currency: "USD",
-      total_value: round(totalValue, 2),
-      total_day_change_value: round(totalDayChangeValue, 2),
-      total_day_change_percent: round(totalDayChangePercent, 4),
+
+      total_value: portfolio.total_value,
+      total_day_change_value: portfolio.total_day_change_value,
+      total_day_change_percent: portfolio.total_day_change_percent,
+
+      portfolio,
+      watchlist,
+
       assets: enrichedAssets
     });
   } catch (err) {
