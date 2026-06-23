@@ -6,12 +6,22 @@ on:
   workflow_dispatch:
 
 jobs:
-  refresh-prices:
+  refresh-finnhub:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Refresh price cache
+      - name: Refresh Finnhub price cache
         run: |
-          curl --fail --silent --show-error "$DASHBOARD_REFRESH_URL"
+          curl --fail --silent --show-error "$REFRESH_FINNHUB_URL"
         env:
-          DASHBOARD_REFRESH_URL: ${{ secrets.DASHBOARD_REFRESH_URL }}
+          REFRESH_FINNHUB_URL: ${{ secrets.REFRESH_FINNHUB_URL }}
+
+  refresh-coingecko:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Refresh CoinGecko price cache
+        run: |
+          curl --fail --silent --show-error "$REFRESH_COINGECKO_URL"
+        env:
+          REFRESH_COINGECKO_URL: ${{ secrets.REFRESH_COINGECKO_URL }}
