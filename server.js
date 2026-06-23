@@ -7,6 +7,7 @@ app.use(cors());
 app.use(express.json());
 
 const portfolioRoutes = require("./routes/portfolio");
+const refreshPricesRoutes = require("./routes/refresh-prices");
 
 function requireDashboardToken(req, res, next) {
   const expectedToken = process.env.PUBLIC_DASHBOARD_TOKEN;
@@ -31,6 +32,7 @@ function requireDashboardToken(req, res, next) {
 }
 
 app.use("/api/portfolio", requireDashboardToken, portfolioRoutes);
+app.use("/api/refresh-prices", requireDashboardToken, refreshPricesRoutes);
 
 app.get("/", (req, res) => {
   res.json({ status: "wealth-os online" });
