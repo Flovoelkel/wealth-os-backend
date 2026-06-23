@@ -2,9 +2,9 @@ const router = require("express").Router();
 const axios = require("axios");
 const db = require("../db");
 
-const REFRESH_VERSION = "price-refresh-v1.6-multi-provider-fx";
+const REFRESH_VERSION = "price-refresh-v1.6.1-provider-throttle";
 const FINNHUB_MIN_INTERVAL_MS = 1200;
-const TWELVE_DATA_MIN_INTERVAL_MS = 1200;
+const TWELVE_DATA_MIN_INTERVAL_MS = 8500;
 
 function toNumberOrNull(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -66,18 +66,26 @@ async function fetchFinnhubQuote(symbol) {
     };
   } catch (err) {
     const status = err.response?.status || null;
+    const providerMessage =
+      err.response?.data?.message ||
+      err.response?.data?.status ||
+      err.response?.data?.code ||
+      null;
+
     return {
       price: null,
       previous_close: null,
       day_change_abs: null,
       day_change_percent: null,
-      source_error: status ? `Request failed with status code ${status}` : err.message,
+      source_error: status
+        ? `Request failed with status code ${status}${providerMessage ? `: ${providerMessage}` : ""}`
+        : err.message,
       last_updated_at: null
     };
   }
 }
 
-async function fetchTwelveDataQuote(symbol) {
+async function fetchTwelveDataQuote(symbol, micCode, exchange) {
   const apikey = process.env.TWELVE_DATA_API_KEY;
 
   if (!apikey) {
@@ -92,8 +100,18 @@ async function fetchTwelveDataQuote(symbol) {
   }
 
   try {
+    const params = { symbol, apikey };
+
+    if (micCode) {
+      params.mic_code = micCode;
+    }
+
+    if (exchange) {
+      params.exchange = exchange;
+    }
+
     const response = await axios.get("https://api.twelvedata.com/quote", {
-      params: { symbol, apikey },
+      params,
       timeout: 10000
     });
 
@@ -136,12 +154,20 @@ async function fetchTwelveDataQuote(symbol) {
     };
   } catch (err) {
     const status = err.response?.status || null;
+    const providerMessage =
+      err.response?.data?.message ||
+      err.response?.data?.status ||
+      err.response?.data?.code ||
+      null;
+
     return {
       price: null,
       previous_close: null,
       day_change_abs: null,
       day_change_percent: null,
-      source_error: status ? `Request failed with status code ${status}` : err.message,
+      source_error: status
+        ? `Request failed with status code ${status}${providerMessage ? `: ${providerMessage}` : ""}`
+        : err.message,
       last_updated_at: null
     };
   }
@@ -188,18 +214,42 @@ async function fetchCoinGeckoPrice(coinId) {
     };
   } catch (err) {
     const status = err.response?.status || null;
+    const providerMessage =
+      err.response?.data?.message ||
+      err.response?.data?.status ||
+      err.response?.data?.code ||
+      null;
+
     return {
       price: null,
       previous_close: null,
       day_change_abs: null,
       day_change_percent: null,
-      source_error: status ? `Request failed with status code ${status}` : err.message,
+      source_error: status
+        ? `Request failed with status code ${status}${providerMessage ? `: ${providerMessage}` : ""}`
+        : err.message,
       last_updated_at: null
     };
   }
 }
 
 async function upsertMarketPrice(provider, symbol, market) {
+  // Do not overwrite a previously valid price with a transient rate-limit error.
+  if (market.source_error && String(market.source_error).includes("429")) {
+    const existing = await db.query(
+      "SELECT price, source_error FROM market_prices WHERE provider = $1 AND symbol = $2",
+      [provider, symbol]
+    );
+
+    const existingPrice = existing.rows[0]?.price;
+    const existingError = existing.rows[0]?.source_error;
+
+    if (existingPrice !== null && existingPrice !== undefined && !existingError) {
+      return;
+    }
+  }
+
+
   await db.query(
     `
     INSERT INTO market_prices (
@@ -298,7 +348,7 @@ async function refreshFxRates(userId) {
   return refreshed;
 }
 
-async function getRefreshCandidates(userId, limit, staleMinutes) {
+async function getRefreshCandidates(userId, limit, staleMinutes, providerFilter) {
   const result = await db.query(
     `
     WITH candidates AS (
@@ -310,7 +360,9 @@ async function getRefreshCandidates(userId, limit, staleMinutes) {
         CASE
           WHEN type = 'crypto' THEN coin_id
           ELSE COALESCE(provider_symbol, symbol)
-        END AS symbol
+        END AS symbol,
+        provider_mic_code,
+        provider_exchange
       FROM assets
       WHERE user_id = $1
         AND COALESCE(live_enabled, true) = true
@@ -319,10 +371,21 @@ async function getRefreshCandidates(userId, limit, staleMinutes) {
           OR
           (type IN ('stock', 'etf') AND COALESCE(provider_symbol, symbol) IS NOT NULL AND COALESCE(provider_symbol, symbol) <> '')
         )
+        AND (
+          $4::text IS NULL
+          OR LOWER(
+            CASE
+              WHEN type = 'crypto' THEN 'coingecko'
+              ELSE COALESCE(data_provider, 'finnhub')
+            END
+          ) = LOWER($4::text)
+        )
     )
     SELECT
       c.provider,
       c.symbol,
+      c.provider_mic_code,
+      c.provider_exchange,
       mp.fetched_at
     FROM candidates c
     LEFT JOIN market_prices mp
@@ -333,7 +396,7 @@ async function getRefreshCandidates(userId, limit, staleMinutes) {
     ORDER BY mp.fetched_at ASC NULLS FIRST, c.provider ASC, c.symbol ASC
     LIMIT $2
     `,
-    [userId, limit, staleMinutes]
+    [userId, limit, staleMinutes, providerFilter || null]
   );
 
   return result.rows;
@@ -347,9 +410,10 @@ router.get("/", async (req, res) => {
     const limit = Math.max(1, Math.min(50, Number(req.query.limit || 10)));
     const staleMinutes = Math.max(0, Number(req.query.stale_minutes || 60));
     const refreshFx = req.query.fx !== "false";
+    const providerFilter = req.query.provider ? String(req.query.provider).toLowerCase() : null;
 
     const fx_results = refreshFx ? await refreshFxRates(userId) : [];
-    const candidates = await getRefreshCandidates(userId, limit, staleMinutes);
+    const candidates = await getRefreshCandidates(userId, limit, staleMinutes, providerFilter);
 
     const results = [];
 
@@ -364,7 +428,11 @@ router.get("/", async (req, res) => {
         market = await fetchFinnhubQuote(symbol);
       } else if (provider === "twelvedata") {
         await sleep(TWELVE_DATA_MIN_INTERVAL_MS);
-        market = await fetchTwelveDataQuote(symbol);
+        market = await fetchTwelveDataQuote(
+          symbol,
+          item.provider_mic_code,
+          item.provider_exchange
+        );
       } else if (provider === "coingecko") {
         market = await fetchCoinGeckoPrice(symbol);
       } else {
@@ -395,6 +463,7 @@ router.get("/", async (req, res) => {
       user_id: Number(userId),
       limit,
       stale_minutes: staleMinutes,
+      provider_filter: providerFilter,
       processed: results.length,
       fx_processed: fx_results.length,
       duration_ms: Date.now() - startedAt,
