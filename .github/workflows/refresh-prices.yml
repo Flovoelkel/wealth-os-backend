@@ -1,0 +1,17 @@
+name: Refresh Wealth OS Prices
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  refresh-prices:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Refresh price cache
+        run: |
+          curl --fail --silent --show-error "$DASHBOARD_REFRESH_URL"
+        env:
+          DASHBOARD_REFRESH_URL: ${{ secrets.DASHBOARD_REFRESH_URL }}
