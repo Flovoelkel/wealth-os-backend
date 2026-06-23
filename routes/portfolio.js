@@ -1,14 +1,7 @@
 const router = require("express").Router();
-const axios = require("axios");
 const db = require("../db");
 
-const ENGINE_VERSION = "price-engine-v1.3-position-value-import";
-
-const MARKET_CACHE = new Map();
-const CACHE_TTL_MS = 30 * 60 * 1000;
-const FINNHUB_MIN_INTERVAL_MS = 250;
-
-let finnhubQueue = Promise.resolve();
+const ENGINE_VERSION = "price-engine-v1.4-market-price-cache";
 
 function toNumberOrNull(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -27,166 +20,11 @@ function round(value, decimals = 2) {
   return Number(n.toFixed(decimals));
 }
 
-function getCacheKey(asset) {
-  return `${asset.type}:${asset.coin_id || asset.symbol || asset.id}`;
+function getMarketKey(provider, symbol) {
+  return `${provider}:${symbol}`;
 }
 
-function getCached(asset) {
-  const key = getCacheKey(asset);
-  const cached = MARKET_CACHE.get(key);
-
-  if (!cached) return null;
-
-  const age = Date.now() - cached.timestamp;
-  if (age > CACHE_TTL_MS) return null;
-
-  return cached.data;
-}
-
-function setCached(asset, data) {
-  const key = getCacheKey(asset);
-  MARKET_CACHE.set(key, {
-    timestamp: Date.now(),
-    data
-  });
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function runFinnhubThrottled(work) {
-  const next = finnhubQueue.then(async () => {
-    await sleep(FINNHUB_MIN_INTERVAL_MS);
-    return work();
-  });
-
-  finnhubQueue = next.catch(() => {});
-  return next;
-}
-
-async function getCryptoPrice(asset) {
-  if (!asset.coin_id) {
-    return {
-      price: null,
-      previous_close: null,
-      day_change_abs: null,
-      day_change_percent: null,
-      source: "coingecko",
-      source_error: "Missing coin_id",
-      last_updated_at: null
-    };
-  }
-
-  const url = "https://api.coingecko.com/api/v3/simple/price";
-
-  const headers = {};
-  if (process.env.COINGECKO_API_KEY) {
-    headers["x-cg-demo-api-key"] = process.env.COINGECKO_API_KEY;
-  }
-
-  const response = await axios.get(url, {
-    params: {
-      ids: asset.coin_id,
-      vs_currencies: "usd",
-      include_24hr_change: "true",
-      include_last_updated_at: "true"
-    },
-    headers,
-    timeout: 8000
-  });
-
-  const data = response.data?.[asset.coin_id];
-
-  if (!data || data.usd === undefined) {
-    return {
-      price: null,
-      previous_close: null,
-      day_change_abs: null,
-      day_change_percent: null,
-      source: "coingecko",
-      source_error: `No price returned for coin_id ${asset.coin_id}`,
-      last_updated_at: null
-    };
-  }
-
-  return {
-    price: toNumberOrNull(data.usd),
-    previous_close: null,
-    day_change_abs: null,
-    day_change_percent: toNumberOrNull(data.usd_24h_change),
-    source: "coingecko",
-    source_error: null,
-    last_updated_at: data.last_updated_at || null
-  };
-}
-
-async function getFinnhubQuote(asset) {
-  const token = process.env.FINNHUB_API_KEY;
-
-  if (!token) {
-    return {
-      price: null,
-      previous_close: null,
-      day_change_abs: null,
-      day_change_percent: null,
-      source: "finnhub",
-      source_error: "Missing FINNHUB_API_KEY",
-      last_updated_at: null
-    };
-  }
-
-  if (!asset.symbol) {
-    return {
-      price: null,
-      previous_close: null,
-      day_change_abs: null,
-      day_change_percent: null,
-      source: "finnhub",
-      source_error: "Missing symbol",
-      last_updated_at: null
-    };
-  }
-
-  const url = "https://finnhub.io/api/v1/quote";
-
-  const response = await runFinnhubThrottled(() =>
-    axios.get(url, {
-      params: {
-        symbol: asset.symbol,
-        token
-      },
-      timeout: 8000
-    })
-  );
-
-  const data = response.data || {};
-  const price = toNumberOrNull(data.c);
-
-  if (price === null || price === 0) {
-    return {
-      price: null,
-      previous_close: toNumberOrNull(data.pc),
-      day_change_abs: toNumberOrNull(data.d),
-      day_change_percent: toNumberOrNull(data.dp),
-      source: "finnhub",
-      source_error: `No valid quote returned for symbol ${asset.symbol}`,
-      last_updated_at: data.t || null
-    };
-  }
-
-  return {
-    price,
-    previous_close: toNumberOrNull(data.pc),
-    day_change_abs: toNumberOrNull(data.d),
-    day_change_percent: toNumberOrNull(data.dp),
-    source: "finnhub",
-    source_error: null,
-    last_updated_at: data.t || null
-  };
-}
-
-async function getManualPrice(asset) {
+function getManualMarket(asset) {
   return {
     price: toNumberOrNull(asset.manual_value),
     previous_close: null,
@@ -194,80 +32,131 @@ async function getManualPrice(asset) {
     day_change_percent: 0,
     source: "manual",
     source_error: null,
-    last_updated_at: null
+    last_updated_at: null,
+    fetched_at: null,
+    used_manual_fallback: false
   };
 }
 
-async function getMarketData(asset) {
-  const cached = getCached(asset);
-  if (cached) return cached;
+function getProviderAndSymbol(asset) {
+  if (asset.type === "crypto" && asset.coin_id) {
+    return {
+      provider: "coingecko",
+      symbol: asset.coin_id
+    };
+  }
 
-  try {
-    let data;
+  if (asset.type === "stock" && asset.symbol) {
+    return {
+      provider: "finnhub",
+      symbol: asset.symbol
+    };
+  }
 
-    if (asset.type === "crypto") {
-      data = await getCryptoPrice(asset);
-    } else if (asset.type === "stock") {
-  data = await getFinnhubQuote(asset);
-    } else if (asset.type === "etf") {
-  data = await getManualPrice(asset);
-    } else if (asset.type === "manual") {
-      data = await getManualPrice(asset);
-    } else {
-      data = {
-        price: null,
-        previous_close: null,
-        day_change_abs: null,
-        day_change_percent: null,
-        source: null,
-        source_error: `Unsupported asset type: ${asset.type}`,
-        last_updated_at: null
-      };
+  return {
+    provider: null,
+    symbol: null
+  };
+}
+
+function getCachedMarket(asset, priceMap) {
+  const manualValue = toNumberOrNull(asset.manual_value);
+  const liveEnabled = asset.live_enabled !== false;
+
+  if (!liveEnabled || asset.type === "manual" || asset.type === "etf") {
+    return getManualMarket(asset);
+  }
+
+  const { provider, symbol } = getProviderAndSymbol(asset);
+
+  if (!provider || !symbol) {
+    if (manualValue !== null) {
+      return getManualMarket(asset);
     }
-
-    if (!data.source_error && data.price !== null) {
-      setCached(asset, data);
-    }
-
-    return data;
-  } catch (err) {
-    const status = err.response?.status || null;
 
     return {
       price: null,
       previous_close: null,
       day_change_abs: null,
       day_change_percent: null,
-      source: asset.type === "crypto" ? "coingecko" : "finnhub",
-      source_error: status
-        ? `Request failed with status code ${status}`
-        : err.message,
-      last_updated_at: null
+      source: null,
+      source_error: "Missing provider or symbol",
+      last_updated_at: null,
+      fetched_at: null,
+      used_manual_fallback: false
     };
   }
-}
 
-function applyManualFallback(asset, market) {
-  const manualFallback = toNumberOrNull(asset.manual_value);
+  const cached = priceMap.get(getMarketKey(provider, symbol));
 
-  if (market.price !== null || manualFallback === null) {
+  if (!cached) {
+    if (manualValue !== null) {
+      return {
+        price: manualValue,
+        previous_close: null,
+        day_change_abs: 0,
+        day_change_percent: 0,
+        source: "manual_fallback",
+        source_error: "No cached market price yet",
+        last_updated_at: null,
+        fetched_at: null,
+        used_manual_fallback: true
+      };
+    }
+
     return {
-      ...market,
+      price: null,
+      previous_close: null,
+      day_change_abs: null,
+      day_change_percent: null,
+      source: provider,
+      source_error: "No cached market price yet",
+      last_updated_at: null,
+      fetched_at: null,
+      used_manual_fallback: false
+    };
+  }
+
+  const price = toNumberOrNull(cached.price);
+
+  if (cached.source_error || price === null) {
+    if (manualValue !== null) {
+      return {
+        price: manualValue,
+        previous_close: null,
+        day_change_abs: 0,
+        day_change_percent: 0,
+        source: "manual_fallback",
+        source_error: cached.source_error || "Cached price is empty",
+        last_updated_at: cached.last_updated_at || null,
+        fetched_at: cached.fetched_at || null,
+        used_manual_fallback: true
+      };
+    }
+
+    return {
+      price: null,
+      previous_close: toNumberOrNull(cached.previous_close),
+      day_change_abs: toNumberOrNull(cached.day_change_abs),
+      day_change_percent: toNumberOrNull(cached.day_change_percent),
+      source: provider,
+      source_error: cached.source_error || "Cached price is empty",
+      last_updated_at: cached.last_updated_at || null,
+      fetched_at: cached.fetched_at || null,
       used_manual_fallback: false
     };
   }
 
   return {
-    price: manualFallback,
-    previous_close: null,
-    day_change_abs: 0,
-    day_change_percent: 0,
-    source: "manual_fallback",
-    source_error: market.source_error
-      ? `External source failed: ${market.source_error}`
-      : null,
-    last_updated_at: null,
-    used_manual_fallback: true
+    price,
+    previous_close: toNumberOrNull(cached.previous_close),
+    day_change_abs: toNumberOrNull(cached.day_change_abs),
+    day_change_percent: toNumberOrNull(cached.day_change_percent),
+    source: provider,
+    source_error: null,
+    last_updated_at: cached.last_updated_at || null,
+    fetched_at: cached.fetched_at || null,
+    used_manual_fallback: false
   };
 }
 
@@ -329,7 +218,7 @@ function calculateValueAndChange(asset, market, quantity) {
     valuationMethod = "manual_position_value";
     value = manualValue;
 
-    if (price === null && (asset.type === "manual" || market.source === "manual_fallback")) {
+    if (price === null) {
       price = manualValue;
     }
 
@@ -362,63 +251,83 @@ function calculateValueAndChange(asset, market, quantity) {
   };
 }
 
+function getCacheAgeSeconds(fetchedAt) {
+  if (!fetchedAt) return null;
+
+  const fetchedTime = new Date(fetchedAt).getTime();
+
+  if (!Number.isFinite(fetchedTime)) return null;
+
+  return Math.max(0, Math.round((Date.now() - fetchedTime) / 1000));
+}
+
 router.get("/", async (req, res) => {
   try {
     const userId = req.query.user_id || 1;
 
-    const result = await db.query(
+    const assetsResult = await db.query(
       "SELECT * FROM assets WHERE user_id = $1 ORDER BY id ASC",
       [userId]
     );
 
-    const enrichedAssets = await Promise.all(
-      result.rows.map(async (asset) => {
-        const quantity = quantityToNumber(asset.quantity);
-        const mode = asset.mode === "watchlist" ? "watchlist" : "portfolio";
-
-        const externalMarket = await getMarketData(asset);
-        const market = applyManualFallback(asset, externalMarket);
-
-        const valueResult = calculateValueAndChange(asset, market, quantity);
-
-        const roundedDayChangeValue = round(valueResult.dayChangeValue, 2);
-        const roundedDayChangePercent = round(market.day_change_percent, 4);
-        const marketDirection = getMarketDirection(
-          roundedDayChangeValue,
-          roundedDayChangePercent
-        );
-
-        return {
-          id: asset.id,
-          user_id: asset.user_id,
-          mode,
-          name: asset.name,
-          type: asset.type,
-          symbol: asset.symbol,
-          coin_id: asset.coin_id,
-          quantity,
-          manual_value:
-            asset.manual_value === null
-              ? null
-              : toNumberOrNull(asset.manual_value),
-
-          price: round(valueResult.price, 4),
-          value: round(valueResult.value, 2),
-          day_change_abs: round(market.day_change_abs, 4),
-          day_change_percent: roundedDayChangePercent,
-          day_change_value: roundedDayChangeValue,
-
-          market_direction: marketDirection,
-          display_color: getDisplayColor(mode, marketDirection),
-          valuation_method: valueResult.valuationMethod,
-
-          source: market.source,
-          source_error: market.source_error || null,
-          used_manual_fallback: market.used_manual_fallback || false,
-          last_updated_at: market.last_updated_at || null
-        };
-      })
+    const pricesResult = await db.query(
+      "SELECT * FROM market_prices"
     );
+
+    const priceMap = new Map();
+
+    for (const row of pricesResult.rows) {
+      priceMap.set(getMarketKey(row.provider, row.symbol), row);
+    }
+
+    const enrichedAssets = assetsResult.rows.map((asset) => {
+      const quantity = quantityToNumber(asset.quantity);
+      const mode = asset.mode === "watchlist" ? "watchlist" : "portfolio";
+
+      const market = getCachedMarket(asset, priceMap);
+      const valueResult = calculateValueAndChange(asset, market, quantity);
+
+      const roundedDayChangeValue = round(valueResult.dayChangeValue, 2);
+      const roundedDayChangePercent = round(market.day_change_percent, 4);
+
+      const marketDirection = getMarketDirection(
+        roundedDayChangeValue,
+        roundedDayChangePercent
+      );
+
+      return {
+        id: asset.id,
+        user_id: asset.user_id,
+        mode,
+        name: asset.name,
+        type: asset.type,
+        symbol: asset.symbol,
+        coin_id: asset.coin_id,
+        quantity,
+        manual_value:
+          asset.manual_value === null
+            ? null
+            : toNumberOrNull(asset.manual_value),
+        live_enabled: asset.live_enabled !== false,
+
+        price: round(valueResult.price, 4),
+        value: round(valueResult.value, 2),
+        day_change_abs: round(market.day_change_abs, 4),
+        day_change_percent: roundedDayChangePercent,
+        day_change_value: roundedDayChangeValue,
+
+        market_direction: marketDirection,
+        display_color: getDisplayColor(mode, marketDirection),
+        valuation_method: valueResult.valuationMethod,
+
+        source: market.source,
+        source_error: market.source_error || null,
+        used_manual_fallback: market.used_manual_fallback || false,
+        last_updated_at: market.last_updated_at || null,
+        fetched_at: market.fetched_at || null,
+        cache_age_seconds: getCacheAgeSeconds(market.fetched_at)
+      };
+    });
 
     const portfolioAssets = enrichedAssets.filter(
       (asset) => asset.mode === "portfolio"
@@ -442,10 +351,10 @@ router.get("/", async (req, res) => {
 
       portfolio,
       watchlist
-
     });
   } catch (err) {
     console.error(err);
+
     res.status(500).json({
       error: "Portfolio engine error",
       details: err.message
