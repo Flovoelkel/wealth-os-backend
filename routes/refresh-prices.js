@@ -2,8 +2,9 @@ const router = require("express").Router();
 const axios = require("axios");
 const db = require("../db");
 
-const REFRESH_VERSION = "price-refresh-v1.4";
+const REFRESH_VERSION = "price-refresh-v1.6-multi-provider-fx";
 const FINNHUB_MIN_INTERVAL_MS = 1200;
+const TWELVE_DATA_MIN_INTERVAL_MS = 1200;
 
 function toNumberOrNull(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -13,6 +14,12 @@ function toNumberOrNull(value) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeProvider(provider, type) {
+  if (type === "crypto") return "coingecko";
+  if (provider === "twelvedata") return "twelvedata";
+  return "finnhub";
 }
 
 async function fetchFinnhubQuote(symbol) {
@@ -31,11 +38,8 @@ async function fetchFinnhubQuote(symbol) {
 
   try {
     const response = await axios.get("https://finnhub.io/api/v1/quote", {
-      params: {
-        symbol,
-        token
-      },
-      timeout: 8000
+      params: { symbol, token },
+      timeout: 10000
     });
 
     const data = response.data || {};
@@ -62,15 +66,82 @@ async function fetchFinnhubQuote(symbol) {
     };
   } catch (err) {
     const status = err.response?.status || null;
-
     return {
       price: null,
       previous_close: null,
       day_change_abs: null,
       day_change_percent: null,
-      source_error: status
-        ? `Request failed with status code ${status}`
-        : err.message,
+      source_error: status ? `Request failed with status code ${status}` : err.message,
+      last_updated_at: null
+    };
+  }
+}
+
+async function fetchTwelveDataQuote(symbol) {
+  const apikey = process.env.TWELVE_DATA_API_KEY;
+
+  if (!apikey) {
+    return {
+      price: null,
+      previous_close: null,
+      day_change_abs: null,
+      day_change_percent: null,
+      source_error: "Missing TWELVE_DATA_API_KEY",
+      last_updated_at: null
+    };
+  }
+
+  try {
+    const response = await axios.get("https://api.twelvedata.com/quote", {
+      params: { symbol, apikey },
+      timeout: 10000
+    });
+
+    const data = response.data || {};
+
+    if (data.status === "error" || data.code || data.message === "**symbol** not found") {
+      return {
+        price: null,
+        previous_close: null,
+        day_change_abs: null,
+        day_change_percent: null,
+        source_error: data.message || `Twelve Data error for symbol ${symbol}`,
+        last_updated_at: null
+      };
+    }
+
+    const price =
+      toNumberOrNull(data.price) ??
+      toNumberOrNull(data.close) ??
+      toNumberOrNull(data.previous_close);
+
+    if (price === null || price === 0) {
+      return {
+        price: null,
+        previous_close: toNumberOrNull(data.previous_close),
+        day_change_abs: toNumberOrNull(data.change),
+        day_change_percent: toNumberOrNull(data.percent_change),
+        source_error: `No valid quote returned for symbol ${symbol}`,
+        last_updated_at: data.timestamp || null
+      };
+    }
+
+    return {
+      price,
+      previous_close: toNumberOrNull(data.previous_close),
+      day_change_abs: toNumberOrNull(data.change),
+      day_change_percent: toNumberOrNull(data.percent_change),
+      source_error: null,
+      last_updated_at: data.timestamp || null
+    };
+  } catch (err) {
+    const status = err.response?.status || null;
+    return {
+      price: null,
+      previous_close: null,
+      day_change_abs: null,
+      day_change_percent: null,
+      source_error: status ? `Request failed with status code ${status}` : err.message,
       last_updated_at: null
     };
   }
@@ -79,24 +150,20 @@ async function fetchFinnhubQuote(symbol) {
 async function fetchCoinGeckoPrice(coinId) {
   try {
     const headers = {};
-
     if (process.env.COINGECKO_API_KEY) {
       headers["x-cg-demo-api-key"] = process.env.COINGECKO_API_KEY;
     }
 
-    const response = await axios.get(
-      "https://api.coingecko.com/api/v3/simple/price",
-      {
-        params: {
-          ids: coinId,
-          vs_currencies: "usd",
-          include_24hr_change: "true",
-          include_last_updated_at: "true"
-        },
-        headers,
-        timeout: 8000
-      }
-    );
+    const response = await axios.get("https://api.coingecko.com/api/v3/simple/price", {
+      params: {
+        ids: coinId,
+        vs_currencies: "usd",
+        include_24hr_change: "true",
+        include_last_updated_at: "true"
+      },
+      headers,
+      timeout: 10000
+    });
 
     const data = response.data?.[coinId];
 
@@ -121,15 +188,12 @@ async function fetchCoinGeckoPrice(coinId) {
     };
   } catch (err) {
     const status = err.response?.status || null;
-
     return {
       price: null,
       previous_close: null,
       day_change_abs: null,
       day_change_percent: null,
-      source_error: status
-        ? `Request failed with status code ${status}`
-        : err.message,
+      source_error: status ? `Request failed with status code ${status}` : err.message,
       last_updated_at: null
     };
   }
@@ -173,6 +237,67 @@ async function upsertMarketPrice(provider, symbol, market) {
   );
 }
 
+async function upsertFxRate(base, quote, rate) {
+  await db.query(
+    `
+    INSERT INTO fx_rates (base, quote, rate, fetched_at)
+    VALUES ($1, $2, $3, NOW())
+    ON CONFLICT (base, quote)
+    DO UPDATE SET
+      rate = EXCLUDED.rate,
+      fetched_at = NOW()
+    `,
+    [base, quote, rate]
+  );
+}
+
+async function refreshFxRates(userId) {
+  const result = await db.query(
+    `
+    SELECT DISTINCT UPPER(COALESCE(price_currency, 'EUR')) AS currency
+    FROM assets
+    WHERE user_id = $1
+      AND COALESCE(price_currency, 'EUR') <> 'EUR'
+      AND COALESCE(price_currency, '') <> ''
+    ORDER BY currency ASC
+    `,
+    [userId]
+  );
+
+  const refreshed = [];
+
+  for (const row of result.rows) {
+    const base = row.currency;
+    const fxBase = base === "GBX" ? "GBP" : base;
+
+    try {
+      const response = await axios.get(
+        `https://api.frankfurter.dev/v2/rate/${encodeURIComponent(fxBase)}/EUR`,
+        { timeout: 10000 }
+      );
+
+      let rate = toNumberOrNull(response.data?.rate);
+
+      // London-listed quotes are often returned in pence. GBX = GBP pence.
+      if (base === "GBX" && rate !== null) {
+        rate = rate / 100;
+      }
+
+      if (rate !== null) {
+        await upsertFxRate(base, "EUR", rate);
+        refreshed.push({ base, quote: "EUR", rate, ok: true });
+      } else {
+        refreshed.push({ base, quote: "EUR", rate: null, ok: false, error: "No FX rate returned" });
+      }
+    } catch (err) {
+      refreshed.push({ base, quote: "EUR", rate: null, ok: false, error: err.message });
+    }
+  }
+
+  await upsertFxRate("EUR", "EUR", 1);
+  return refreshed;
+}
+
 async function getRefreshCandidates(userId, limit, staleMinutes) {
   const result = await db.query(
     `
@@ -180,11 +305,11 @@ async function getRefreshCandidates(userId, limit, staleMinutes) {
       SELECT DISTINCT
         CASE
           WHEN type = 'crypto' THEN 'coingecko'
-          ELSE 'finnhub'
+          ELSE COALESCE(data_provider, 'finnhub')
         END AS provider,
         CASE
           WHEN type = 'crypto' THEN coin_id
-          ELSE symbol
+          ELSE COALESCE(provider_symbol, symbol)
         END AS symbol
       FROM assets
       WHERE user_id = $1
@@ -192,7 +317,7 @@ async function getRefreshCandidates(userId, limit, staleMinutes) {
         AND (
           (type = 'crypto' AND coin_id IS NOT NULL AND coin_id <> '')
           OR
-          (type = 'stock' AND symbol IS NOT NULL AND symbol <> '')
+          (type IN ('stock', 'etf') AND COALESCE(provider_symbol, symbol) IS NOT NULL AND COALESCE(provider_symbol, symbol) <> '')
         )
     )
     SELECT
@@ -219,19 +344,17 @@ router.get("/", async (req, res) => {
 
   try {
     const userId = req.query.user_id || 1;
-    const limit = Math.max(1, Math.min(50, Number(req.query.limit || 25)));
-    const staleMinutes = Math.max(0, Number(req.query.stale_minutes || 30));
+    const limit = Math.max(1, Math.min(50, Number(req.query.limit || 10)));
+    const staleMinutes = Math.max(0, Number(req.query.stale_minutes || 60));
+    const refreshFx = req.query.fx !== "false";
 
-    const candidates = await getRefreshCandidates(
-      userId,
-      limit,
-      staleMinutes
-    );
+    const fx_results = refreshFx ? await refreshFxRates(userId) : [];
+    const candidates = await getRefreshCandidates(userId, limit, staleMinutes);
 
     const results = [];
 
     for (const item of candidates) {
-      const provider = item.provider;
+      const provider = normalizeProvider(item.provider);
       const symbol = item.symbol;
 
       let market;
@@ -239,6 +362,9 @@ router.get("/", async (req, res) => {
       if (provider === "finnhub") {
         await sleep(FINNHUB_MIN_INTERVAL_MS);
         market = await fetchFinnhubQuote(symbol);
+      } else if (provider === "twelvedata") {
+        await sleep(TWELVE_DATA_MIN_INTERVAL_MS);
+        market = await fetchTwelveDataQuote(symbol);
       } else if (provider === "coingecko") {
         market = await fetchCoinGeckoPrice(symbol);
       } else {
@@ -270,12 +396,13 @@ router.get("/", async (req, res) => {
       limit,
       stale_minutes: staleMinutes,
       processed: results.length,
+      fx_processed: fx_results.length,
       duration_ms: Date.now() - startedAt,
+      fx_results,
       results
     });
   } catch (err) {
     console.error(err);
-
     res.status(500).json({
       error: "Refresh prices error",
       details: err.message
