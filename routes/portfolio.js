@@ -2,7 +2,7 @@ const router = require("express").Router();
 const axios = require("axios");
 const db = require("../db");
 
-const ENGINE_VERSION = "price-engine-v1.2-portfolio-watchlist";
+const ENGINE_VERSION = "price-engine-v1.3-position-value-import";
 
 const MARKET_CACHE = new Map();
 const CACHE_TTL_MS = 5 * 60 * 1000;
@@ -42,7 +42,6 @@ function getCached(asset) {
 
 function setCached(asset, data) {
   const key = getCacheKey(asset);
-
   MARKET_CACHE.set(key, {
     timestamp: Date.now(),
     data
@@ -65,7 +64,6 @@ async function getCryptoPrice(asset) {
   const url = "https://api.coingecko.com/api/v3/simple/price";
 
   const headers = {};
-
   if (process.env.COINGECKO_API_KEY) {
     headers["x-cg-demo-api-key"] = process.env.COINGECKO_API_KEY;
   }
@@ -255,7 +253,6 @@ function applyManualFallback(asset, market) {
 function getMarketDirection(dayChangeValue, dayChangePercent) {
   const value = toNumberOrNull(dayChangeValue);
   const percent = toNumberOrNull(dayChangePercent);
-
   const signal = value !== null ? value : percent;
 
   if (signal === null) return "unknown";
@@ -298,6 +295,52 @@ function summarizeAssets(assets) {
   };
 }
 
+function calculateValueAndChange(asset, market, quantity) {
+  const manualValue = toNumberOrNull(asset.manual_value);
+  const useManualPositionValue = manualValue !== null && quantity === 0;
+
+  let price = market.price;
+  let value = null;
+  let dayChangeValue = null;
+  let valuationMethod = "quantity_times_price";
+
+  if (useManualPositionValue) {
+    valuationMethod = "manual_position_value";
+    value = manualValue;
+
+    if (price === null && (asset.type === "manual" || market.source === "manual_fallback")) {
+      price = manualValue;
+    }
+
+    if (market.day_change_percent !== null && market.day_change_percent !== undefined) {
+      dayChangeValue = value * (market.day_change_percent / 100);
+    } else if (market.day_change_abs !== null && market.day_change_abs !== undefined && market.price) {
+      dayChangeValue = value * (market.day_change_abs / market.price);
+    } else {
+      dayChangeValue = 0;
+    }
+  } else {
+    value = price === null ? null : price * quantity;
+
+    if (market.day_change_abs !== null && market.day_change_abs !== undefined) {
+      dayChangeValue = market.day_change_abs * quantity;
+    } else if (
+      value !== null &&
+      market.day_change_percent !== null &&
+      market.day_change_percent !== undefined
+    ) {
+      dayChangeValue = value * (market.day_change_percent / 100);
+    }
+  }
+
+  return {
+    price,
+    value,
+    dayChangeValue,
+    valuationMethod
+  };
+}
+
 router.get("/", async (req, res) => {
   try {
     const userId = req.query.user_id || 1;
@@ -315,25 +358,9 @@ router.get("/", async (req, res) => {
         const externalMarket = await getMarketData(asset);
         const market = applyManualFallback(asset, externalMarket);
 
-        const price = market.price;
-        const value = price === null ? null : price * quantity;
+        const valueResult = calculateValueAndChange(asset, market, quantity);
 
-        let dayChangeValue = null;
-
-        if (
-          market.day_change_abs !== null &&
-          market.day_change_abs !== undefined
-        ) {
-          dayChangeValue = market.day_change_abs * quantity;
-        } else if (
-          value !== null &&
-          market.day_change_percent !== null &&
-          market.day_change_percent !== undefined
-        ) {
-          dayChangeValue = value * (market.day_change_percent / 100);
-        }
-
-        const roundedDayChangeValue = round(dayChangeValue, 2);
+        const roundedDayChangeValue = round(valueResult.dayChangeValue, 2);
         const roundedDayChangePercent = round(market.day_change_percent, 4);
         const marketDirection = getMarketDirection(
           roundedDayChangeValue,
@@ -354,14 +381,15 @@ router.get("/", async (req, res) => {
               ? null
               : toNumberOrNull(asset.manual_value),
 
-          price: round(price, 4),
-          value: round(value, 2),
+          price: round(valueResult.price, 4),
+          value: round(valueResult.value, 2),
           day_change_abs: round(market.day_change_abs, 4),
           day_change_percent: roundedDayChangePercent,
           day_change_value: roundedDayChangeValue,
 
           market_direction: marketDirection,
           display_color: getDisplayColor(mode, marketDirection),
+          valuation_method: valueResult.valuationMethod,
 
           source: market.source,
           source_error: market.source_error || null,
