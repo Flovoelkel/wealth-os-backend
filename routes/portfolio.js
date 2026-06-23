@@ -5,7 +5,10 @@ const db = require("../db");
 const ENGINE_VERSION = "price-engine-v1.3-position-value-import";
 
 const MARKET_CACHE = new Map();
-const CACHE_TTL_MS = 5 * 60 * 1000;
+const CACHE_TTL_MS = 30 * 60 * 1000;
+const FINNHUB_MIN_INTERVAL_MS = 250;
+
+let finnhubQueue = Promise.resolve();
 
 function toNumberOrNull(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -46,6 +49,20 @@ function setCached(asset, data) {
     timestamp: Date.now(),
     data
   });
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function runFinnhubThrottled(work) {
+  const next = finnhubQueue.then(async () => {
+    await sleep(FINNHUB_MIN_INTERVAL_MS);
+    return work();
+  });
+
+  finnhubQueue = next.catch(() => {});
+  return next;
 }
 
 async function getCryptoPrice(asset) {
@@ -133,13 +150,15 @@ async function getFinnhubQuote(asset) {
 
   const url = "https://finnhub.io/api/v1/quote";
 
-  const response = await axios.get(url, {
-    params: {
-      symbol: asset.symbol,
-      token
-    },
-    timeout: 8000
-  });
+  const response = await runFinnhubThrottled(() =>
+    axios.get(url, {
+      params: {
+        symbol: asset.symbol,
+        token
+      },
+      timeout: 8000
+    })
+  );
 
   const data = response.data || {};
   const price = toNumberOrNull(data.c);
@@ -188,8 +207,10 @@ async function getMarketData(asset) {
 
     if (asset.type === "crypto") {
       data = await getCryptoPrice(asset);
-    } else if (asset.type === "stock" || asset.type === "etf") {
-      data = await getFinnhubQuote(asset);
+    } else if (asset.type === "stock") {
+  data = await getFinnhubQuote(asset);
+    } else if (asset.type === "etf") {
+  data = await getManualPrice(asset);
     } else if (asset.type === "manual") {
       data = await getManualPrice(asset);
     } else {
