@@ -1,7 +1,7 @@
 const router = require("express").Router();
 const db = require("../db");
 
-const ENGINE_VERSION = "price-engine-v1.4-market-price-cache";
+const ENGINE_VERSION = "price-engine-v1.6-quantity-target-fx";
 
 function toNumberOrNull(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -24,9 +24,39 @@ function getMarketKey(provider, symbol) {
   return `${provider}:${symbol}`;
 }
 
+function normalizeProvider(asset) {
+  if (asset.type === "crypto") return "coingecko";
+  if (asset.data_provider === "twelvedata") return "twelvedata";
+  return "finnhub";
+}
+
+function getProviderAndSymbol(asset) {
+  if (asset.type === "crypto" && asset.coin_id) {
+    return { provider: "coingecko", symbol: asset.coin_id };
+  }
+
+  if ((asset.type === "stock" || asset.type === "etf") && (asset.provider_symbol || asset.symbol)) {
+    return {
+      provider: normalizeProvider(asset),
+      symbol: asset.provider_symbol || asset.symbol
+    };
+  }
+
+  return { provider: null, symbol: null };
+}
+
+function getFxRate(asset, fxMap) {
+  const currency = String(asset.price_currency || "EUR").toUpperCase();
+  if (currency === "EUR") return 1;
+
+  const rate = toNumberOrNull(fxMap.get(`${currency}:EUR`));
+  return rate === null ? 1 : rate;
+}
+
 function getManualMarket(asset) {
   return {
     price: toNumberOrNull(asset.manual_value),
+    price_raw: toNumberOrNull(asset.manual_value),
     previous_close: null,
     day_change_abs: 0,
     day_change_percent: 0,
@@ -38,44 +68,23 @@ function getManualMarket(asset) {
   };
 }
 
-function getProviderAndSymbol(asset) {
-  if (asset.type === "crypto" && asset.coin_id) {
-    return {
-      provider: "coingecko",
-      symbol: asset.coin_id
-    };
-  }
-
-  if (asset.type === "stock" && asset.symbol) {
-    return {
-      provider: "finnhub",
-      symbol: asset.symbol
-    };
-  }
-
-  return {
-    provider: null,
-    symbol: null
-  };
-}
-
-function getCachedMarket(asset, priceMap) {
+function getCachedMarket(asset, priceMap, fxMap) {
   const manualValue = toNumberOrNull(asset.manual_value);
   const liveEnabled = asset.live_enabled !== false;
+  const fxRate = getFxRate(asset, fxMap);
 
-  if (!liveEnabled || asset.type === "manual" || asset.type === "etf") {
+  if (!liveEnabled || asset.type === "manual") {
     return getManualMarket(asset);
   }
 
   const { provider, symbol } = getProviderAndSymbol(asset);
 
   if (!provider || !symbol) {
-    if (manualValue !== null) {
-      return getManualMarket(asset);
-    }
+    if (manualValue !== null) return getManualMarket(asset);
 
     return {
       price: null,
+      price_raw: null,
       previous_close: null,
       day_change_abs: null,
       day_change_percent: null,
@@ -93,6 +102,7 @@ function getCachedMarket(asset, priceMap) {
     if (manualValue !== null) {
       return {
         price: manualValue,
+        price_raw: manualValue,
         previous_close: null,
         day_change_abs: 0,
         day_change_percent: 0,
@@ -106,6 +116,7 @@ function getCachedMarket(asset, priceMap) {
 
     return {
       price: null,
+      price_raw: null,
       previous_close: null,
       day_change_abs: null,
       day_change_percent: null,
@@ -117,12 +128,13 @@ function getCachedMarket(asset, priceMap) {
     };
   }
 
-  const price = toNumberOrNull(cached.price);
+  const priceRaw = toNumberOrNull(cached.price);
 
-  if (cached.source_error || price === null) {
+  if (cached.source_error || priceRaw === null) {
     if (manualValue !== null) {
       return {
         price: manualValue,
+        price_raw: manualValue,
         previous_close: null,
         day_change_abs: 0,
         day_change_percent: 0,
@@ -136,6 +148,7 @@ function getCachedMarket(asset, priceMap) {
 
     return {
       price: null,
+      price_raw: null,
       previous_close: toNumberOrNull(cached.previous_close),
       day_change_abs: toNumberOrNull(cached.day_change_abs),
       day_change_percent: toNumberOrNull(cached.day_change_percent),
@@ -148,9 +161,13 @@ function getCachedMarket(asset, priceMap) {
   }
 
   return {
-    price,
+    price: priceRaw * fxRate,
+    price_raw: priceRaw,
     previous_close: toNumberOrNull(cached.previous_close),
-    day_change_abs: toNumberOrNull(cached.day_change_abs),
+    day_change_abs:
+      toNumberOrNull(cached.day_change_abs) === null
+        ? null
+        : toNumberOrNull(cached.day_change_abs) * fxRate,
     day_change_percent: toNumberOrNull(cached.day_change_percent),
     source: provider,
     source_error: null,
@@ -172,25 +189,14 @@ function getMarketDirection(dayChangeValue, dayChangePercent) {
 }
 
 function getDisplayColor(mode, marketDirection) {
-  if (marketDirection === "unknown" || marketDirection === "flat") {
-    return "neutral";
-  }
-
-  if (mode === "watchlist") {
-    return marketDirection === "down" ? "green" : "red";
-  }
-
+  if (marketDirection === "unknown" || marketDirection === "flat") return "neutral";
+  if (mode === "watchlist") return marketDirection === "down" ? "green" : "red";
   return marketDirection === "up" ? "green" : "red";
 }
 
 function summarizeAssets(assets) {
-  const totalValue = assets.reduce((sum, asset) => {
-    return sum + (asset.value || 0);
-  }, 0);
-
-  const totalDayChangeValue = assets.reduce((sum, asset) => {
-    return sum + (asset.day_change_value || 0);
-  }, 0);
+  const totalValue = assets.reduce((sum, asset) => sum + (asset.value || 0), 0);
+  const totalDayChangeValue = assets.reduce((sum, asset) => sum + (asset.day_change_value || 0), 0);
 
   const totalDayChangePercent =
     totalValue > 0 && totalValue - totalDayChangeValue !== 0
@@ -207,20 +213,24 @@ function summarizeAssets(assets) {
 
 function calculateValueAndChange(asset, market, quantity) {
   const manualValue = toNumberOrNull(asset.manual_value);
-  const useManualPositionValue = manualValue !== null && quantity === 0;
+  const price = market.price;
 
-  let price = market.price;
   let value = null;
   let dayChangeValue = null;
   let valuationMethod = "quantity_times_price";
 
-  if (useManualPositionValue) {
+  if (quantity > 0 && price !== null) {
+    valuationMethod = "quantity_times_price";
+    value = price * quantity;
+
+    if (market.day_change_abs !== null && market.day_change_abs !== undefined) {
+      dayChangeValue = market.day_change_abs * quantity;
+    } else if (market.day_change_percent !== null && market.day_change_percent !== undefined) {
+      dayChangeValue = value * (market.day_change_percent / 100);
+    }
+  } else if (manualValue !== null) {
     valuationMethod = "manual_position_value";
     value = manualValue;
-
-    if (price === null) {
-      price = manualValue;
-    }
 
     if (market.day_change_percent !== null && market.day_change_percent !== undefined) {
       dayChangeValue = value * (market.day_change_percent / 100);
@@ -243,22 +253,68 @@ function calculateValueAndChange(asset, market, quantity) {
     }
   }
 
-  return {
-    price,
-    value,
-    dayChangeValue,
-    valuationMethod
-  };
+  return { value, dayChangeValue, valuationMethod };
 }
 
 function getCacheAgeSeconds(fetchedAt) {
   if (!fetchedAt) return null;
-
   const fetchedTime = new Date(fetchedAt).getTime();
-
   if (!Number.isFinite(fetchedTime)) return null;
-
   return Math.max(0, Math.round((Date.now() - fetchedTime) / 1000));
+}
+
+function enrichAsset(asset, priceMap, fxMap, forcedMode = null, syntheticOverrides = null) {
+  const quantity = quantityToNumber(asset.quantity);
+  const mode = forcedMode || (asset.mode === "watchlist" ? "watchlist" : "portfolio");
+  const market = getCachedMarket(asset, priceMap, fxMap);
+  const valueResult = calculateValueAndChange(asset, market, quantity);
+
+  const roundedDayChangeValue = round(valueResult.dayChangeValue, 2);
+  const roundedDayChangePercent = round(market.day_change_percent, 4);
+  const marketDirection = getMarketDirection(roundedDayChangeValue, roundedDayChangePercent);
+
+  const provider = getProviderAndSymbol(asset).provider;
+  const providerSymbol = getProviderAndSymbol(asset).symbol;
+
+  return {
+    id: syntheticOverrides?.id || asset.id,
+    user_id: asset.user_id,
+    mode,
+    name: syntheticOverrides?.name || asset.name,
+    type: asset.type,
+    symbol: asset.symbol,
+    provider_symbol: providerSymbol,
+    data_provider: provider,
+    coin_id: asset.coin_id,
+    quantity,
+    manual_value: asset.manual_value === null ? null : toNumberOrNull(asset.manual_value),
+    target_value: asset.target_value === null ? null : toNumberOrNull(asset.target_value),
+    price_currency: asset.price_currency || "EUR",
+    live_enabled: asset.live_enabled !== false,
+    is_synthetic: Boolean(syntheticOverrides),
+    base_asset_id: syntheticOverrides?.base_asset_id || null,
+
+    price: round(market.price, 4),
+    price_raw: round(market.price_raw, 4),
+    value: syntheticOverrides?.value !== undefined ? round(syntheticOverrides.value, 2) : round(valueResult.value, 2),
+    day_change_abs: round(market.day_change_abs, 4),
+    day_change_percent: roundedDayChangePercent,
+    day_change_value:
+      syntheticOverrides?.day_change_value !== undefined
+        ? round(syntheticOverrides.day_change_value, 2)
+        : roundedDayChangeValue,
+
+    market_direction: marketDirection,
+    display_color: getDisplayColor(mode, marketDirection),
+    valuation_method: syntheticOverrides?.valuation_method || valueResult.valuationMethod,
+
+    source: market.source,
+    source_error: market.source_error || null,
+    used_manual_fallback: market.used_manual_fallback || false,
+    last_updated_at: market.last_updated_at || null,
+    fetched_at: market.fetched_at || null,
+    cache_age_seconds: getCacheAgeSeconds(market.fetched_at)
+  };
 }
 
 router.get("/", async (req, res) => {
@@ -270,72 +326,63 @@ router.get("/", async (req, res) => {
       [userId]
     );
 
-    const pricesResult = await db.query(
-      "SELECT * FROM market_prices"
-    );
+    const pricesResult = await db.query("SELECT * FROM market_prices");
+    const fxResult = await db.query("SELECT * FROM fx_rates");
 
     const priceMap = new Map();
-
     for (const row of pricesResult.rows) {
       priceMap.set(getMarketKey(row.provider, row.symbol), row);
     }
 
-    const enrichedAssets = assetsResult.rows.map((asset) => {
-      const quantity = quantityToNumber(asset.quantity);
-      const mode = asset.mode === "watchlist" ? "watchlist" : "portfolio";
+    const fxMap = new Map();
+    for (const row of fxResult.rows) {
+      fxMap.set(`${row.base}:${row.quote}`, row.rate);
+    }
+    fxMap.set("EUR:EUR", 1);
 
-      const market = getCachedMarket(asset, priceMap);
-      const valueResult = calculateValueAndChange(asset, market, quantity);
+    const enrichedAssets = assetsResult.rows.map((asset) => enrichAsset(asset, priceMap, fxMap));
 
-      const roundedDayChangeValue = round(valueResult.dayChangeValue, 2);
-      const roundedDayChangePercent = round(market.day_change_percent, 4);
+    const portfolioAssets = enrichedAssets.filter((asset) => asset.mode === "portfolio");
+    const originalWatchlistAssets = enrichedAssets.filter((asset) => asset.mode === "watchlist");
 
-      const marketDirection = getMarketDirection(
-        roundedDayChangeValue,
-        roundedDayChangePercent
-      );
+    const targetGapAssets = [];
 
-      return {
-        id: asset.id,
-        user_id: asset.user_id,
-        mode,
-        name: asset.name,
-        type: asset.type,
-        symbol: asset.symbol,
-        coin_id: asset.coin_id,
-        quantity,
-        manual_value:
-          asset.manual_value === null
-            ? null
-            : toNumberOrNull(asset.manual_value),
-        live_enabled: asset.live_enabled !== false,
+    for (const asset of portfolioAssets) {
+      const targetValue = toNumberOrNull(asset.target_value);
+      const currentValue = toNumberOrNull(asset.value);
 
-        price: round(valueResult.price, 4),
-        value: round(valueResult.value, 2),
-        day_change_abs: round(market.day_change_abs, 4),
-        day_change_percent: roundedDayChangePercent,
-        day_change_value: roundedDayChangeValue,
+      if (targetValue !== null && currentValue !== null && targetValue > currentValue) {
+        const gapValue = targetValue - currentValue;
+        const dayChangeValue =
+          asset.day_change_percent !== null && asset.day_change_percent !== undefined
+            ? gapValue * (asset.day_change_percent / 100)
+            : 0;
 
-        market_direction: marketDirection,
-        display_color: getDisplayColor(mode, marketDirection),
-        valuation_method: valueResult.valuationMethod,
+        const syntheticAsset = {
+          ...asset,
+          id: `gap-${asset.id}`,
+          mode: "watchlist",
+          name: `${asset.name} Ziel-Lücke`,
+          value: round(gapValue, 2),
+          day_change_value: round(dayChangeValue, 2),
+          valuation_method: "target_gap",
+          is_synthetic: true,
+          base_asset_id: asset.id,
+          manual_value: null,
+          quantity: 0
+        };
 
-        source: market.source,
-        source_error: market.source_error || null,
-        used_manual_fallback: market.used_manual_fallback || false,
-        last_updated_at: market.last_updated_at || null,
-        fetched_at: market.fetched_at || null,
-        cache_age_seconds: getCacheAgeSeconds(market.fetched_at)
-      };
-    });
+        syntheticAsset.market_direction = getMarketDirection(
+          syntheticAsset.day_change_value,
+          syntheticAsset.day_change_percent
+        );
+        syntheticAsset.display_color = getDisplayColor("watchlist", syntheticAsset.market_direction);
 
-    const portfolioAssets = enrichedAssets.filter(
-      (asset) => asset.mode === "portfolio"
-    );
+        targetGapAssets.push(syntheticAsset);
+      }
+    }
 
-    const watchlistAssets = enrichedAssets.filter(
-      (asset) => asset.mode === "watchlist"
-    );
+    const watchlistAssets = [...originalWatchlistAssets, ...targetGapAssets];
 
     const portfolio = summarizeAssets(portfolioAssets);
     const watchlist = summarizeAssets(watchlistAssets);
@@ -344,17 +391,18 @@ router.get("/", async (req, res) => {
       engine_version: ENGINE_VERSION,
       user_id: Number(userId),
       currency: "EUR",
-
       total_value: portfolio.total_value,
       total_day_change_value: portfolio.total_day_change_value,
       total_day_change_percent: portfolio.total_day_change_percent,
-
       portfolio,
-      watchlist
+      watchlist,
+      target_gaps: {
+        count: targetGapAssets.length,
+        total_value: round(targetGapAssets.reduce((sum, asset) => sum + (asset.value || 0), 0), 2)
+      }
     });
   } catch (err) {
     console.error(err);
-
     res.status(500).json({
       error: "Portfolio engine error",
       details: err.message
