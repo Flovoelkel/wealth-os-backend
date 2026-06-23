@@ -17,3 +17,10 @@ app.get("/", (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log("Server running on " + PORT));
+
+app.get("/debug/env", (req, res) => {
+  res.json({
+    hasFinnhubKey: Boolean(process.env.FINNHUB_API_KEY),
+    hasCoinGeckoKey: Boolean(process.env.COINGECKO_API_KEY)
+  });
+});
