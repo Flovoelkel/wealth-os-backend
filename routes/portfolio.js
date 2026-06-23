@@ -240,7 +240,20 @@ router.get("/", async (req, res) => {
         const quantity = quantityToNumber(asset.quantity);
         const market = await getMarketData(asset);
 
-        const price = market.price;
+        let price = market.price;
+        let source = market.source;
+        let sourceError = market.source_error || null;
+        
+        const manualFallback = toNumberOrNull(asset.manual_value);
+        
+        if (price === null && manualFallback !== null) {
+          price = manualFallback;
+          source = "manual_fallback";
+          sourceError = market.source_error
+            ? `External source failed: ${market.source_error}`
+            : null;
+        }
+        
         const value = price === null ? null : price * quantity;
 
         let dayChangeValue = null;
@@ -277,8 +290,8 @@ router.get("/", async (req, res) => {
           day_change_percent: round(market.day_change_percent, 4),
           day_change_value: round(dayChangeValue, 2),
 
-          source: market.source,
-          source_error: market.source_error || null,
+          source,
+          source_error: sourceError,
           last_updated_at: market.last_updated_at || null
         };
       })
