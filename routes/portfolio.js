@@ -2,6 +2,8 @@ const router = require("express").Router();
 const axios = require("axios");
 const db = require("../db");
 
+const ENGINE_VERSION = "price-engine-v1.1-manual-fallback";
+
 const MARKET_CACHE = new Map();
 const CACHE_TTL_MS = 5 * 60 * 1000;
 
@@ -226,6 +228,30 @@ async function getMarketData(asset) {
   }
 }
 
+function applyManualFallback(asset, market) {
+  const manualFallback = toNumberOrNull(asset.manual_value);
+
+  if (market.price !== null || manualFallback === null) {
+    return {
+      ...market,
+      used_manual_fallback: false
+    };
+  }
+
+  return {
+    price: manualFallback,
+    previous_close: null,
+    day_change_abs: 0,
+    day_change_percent: 0,
+    source: "manual_fallback",
+    source_error: market.source_error
+      ? `External source failed: ${market.source_error}`
+      : null,
+    last_updated_at: null,
+    used_manual_fallback: true
+  };
+}
+
 router.get("/", async (req, res) => {
   try {
     const userId = req.query.user_id || 1;
@@ -238,22 +264,11 @@ router.get("/", async (req, res) => {
     const enrichedAssets = await Promise.all(
       result.rows.map(async (asset) => {
         const quantity = quantityToNumber(asset.quantity);
-        const market = await getMarketData(asset);
 
-        let price = market.price;
-        let source = market.source;
-        let sourceError = market.source_error || null;
-        
-        const manualFallback = toNumberOrNull(asset.manual_value);
-        
-        if (price === null && manualFallback !== null) {
-          price = manualFallback;
-          source = "manual_fallback";
-          sourceError = market.source_error
-            ? `External source failed: ${market.source_error}`
-            : null;
-        }
-        
+        const externalMarket = await getMarketData(asset);
+        const market = applyManualFallback(asset, externalMarket);
+
+        const price = market.price;
         const value = price === null ? null : price * quantity;
 
         let dayChangeValue = null;
@@ -290,8 +305,9 @@ router.get("/", async (req, res) => {
           day_change_percent: round(market.day_change_percent, 4),
           day_change_value: round(dayChangeValue, 2),
 
-          source,
-          source_error: sourceError,
+          source: market.source,
+          source_error: market.source_error || null,
+          used_manual_fallback: market.used_manual_fallback || false,
           last_updated_at: market.last_updated_at || null
         };
       })
@@ -311,6 +327,7 @@ router.get("/", async (req, res) => {
         : null;
 
     res.json({
+      engine_version: ENGINE_VERSION,
       user_id: Number(userId),
       currency: "USD",
       total_value: round(totalValue, 2),
