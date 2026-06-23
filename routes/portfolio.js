@@ -413,16 +413,15 @@ router.get("/", async (req, res) => {
     res.json({
       engine_version: ENGINE_VERSION,
       user_id: Number(userId),
-      currency: "USD",
+      currency: "EUR",
 
       total_value: portfolio.total_value,
       total_day_change_value: portfolio.total_day_change_value,
       total_day_change_percent: portfolio.total_day_change_percent,
 
       portfolio,
-      watchlist,
+      watchlist
 
-      assets: enrichedAssets
     });
   } catch (err) {
     console.error(err);
