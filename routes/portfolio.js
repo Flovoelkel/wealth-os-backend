@@ -40,6 +40,7 @@ function getCached(asset) {
 
 function setCached(asset, data) {
   const key = getCacheKey(asset);
+
   MARKET_CACHE.set(key, {
     timestamp: Date.now(),
     data
@@ -61,6 +62,12 @@ async function getCryptoPrice(asset) {
 
   const url = "https://api.coingecko.com/api/v3/simple/price";
 
+  const headers = {};
+
+  if (process.env.COINGECKO_API_KEY) {
+    headers["x-cg-demo-api-key"] = process.env.COINGECKO_API_KEY;
+  }
+
   const response = await axios.get(url, {
     params: {
       ids: asset.coin_id,
@@ -68,6 +75,7 @@ async function getCryptoPrice(asset) {
       include_24hr_change: "true",
       include_last_updated_at: "true"
     },
+    headers,
     timeout: 8000
   });
 
@@ -134,7 +142,6 @@ async function getFinnhubQuote(asset) {
   });
 
   const data = response.data || {};
-
   const price = toNumberOrNull(data.c);
 
   if (price === null || price === 0) {
@@ -238,7 +245,10 @@ router.get("/", async (req, res) => {
 
         let dayChangeValue = null;
 
-        if (market.day_change_abs !== null && market.day_change_abs !== undefined) {
+        if (
+          market.day_change_abs !== null &&
+          market.day_change_abs !== undefined
+        ) {
           dayChangeValue = market.day_change_abs * quantity;
         } else if (
           value !== null &&
@@ -256,7 +266,10 @@ router.get("/", async (req, res) => {
           symbol: asset.symbol,
           coin_id: asset.coin_id,
           quantity,
-          manual_value: asset.manual_value === null ? null : toNumberOrNull(asset.manual_value),
+          manual_value:
+            asset.manual_value === null
+              ? null
+              : toNumberOrNull(asset.manual_value),
 
           price: round(price, 4),
           value: round(value, 2),
