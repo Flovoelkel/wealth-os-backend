@@ -17,8 +17,16 @@ function sleep(ms) {
 }
 
 function normalizeProvider(provider, type) {
-  if (type === "crypto") return "coingecko";
-  if (provider === "twelvedata") return "twelvedata";
+  const normalizedProvider = provider ? String(provider).toLowerCase() : null;
+
+  if (type === "crypto" || normalizedProvider === "coingecko") {
+    return "coingecko";
+  }
+
+  if (normalizedProvider === "twelvedata") {
+    return "twelvedata";
+  }
+
   return "finnhub";
 }
 
