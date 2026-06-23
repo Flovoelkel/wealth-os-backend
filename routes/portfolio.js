@@ -2,25 +2,60 @@ const router = require("express").Router();
 const axios = require("axios");
 const db = require("../db");
 
-function toNumber(value) {
-  if (value === null || value === undefined) return 0;
+const MARKET_CACHE = new Map();
+const CACHE_TTL_MS = 5 * 60 * 1000;
+
+function toNumberOrNull(value) {
+  if (value === null || value === undefined || value === "") return null;
   const n = Number(value);
-  return Number.isFinite(n) ? n : 0;
+  return Number.isFinite(n) ? n : null;
+}
+
+function quantityToNumber(value) {
+  const n = toNumberOrNull(value);
+  return n === null ? 0 : n;
 }
 
 function round(value, decimals = 2) {
-  const n = Number(value);
-  if (!Number.isFinite(n)) return null;
+  const n = toNumberOrNull(value);
+  if (n === null) return null;
   return Number(n.toFixed(decimals));
+}
+
+function getCacheKey(asset) {
+  return `${asset.type}:${asset.coin_id || asset.symbol || asset.id}`;
+}
+
+function getCached(asset) {
+  const key = getCacheKey(asset);
+  const cached = MARKET_CACHE.get(key);
+
+  if (!cached) return null;
+
+  const age = Date.now() - cached.timestamp;
+  if (age > CACHE_TTL_MS) return null;
+
+  return cached.data;
+}
+
+function setCached(asset, data) {
+  const key = getCacheKey(asset);
+  MARKET_CACHE.set(key, {
+    timestamp: Date.now(),
+    data
+  });
 }
 
 async function getCryptoPrice(asset) {
   if (!asset.coin_id) {
     return {
       price: null,
+      previous_close: null,
+      day_change_abs: null,
       day_change_percent: null,
       source: "coingecko",
-      source_error: "Missing coin_id"
+      source_error: "Missing coin_id",
+      last_updated_at: null
     };
   }
 
@@ -41,18 +76,23 @@ async function getCryptoPrice(asset) {
   if (!data || data.usd === undefined) {
     return {
       price: null,
+      previous_close: null,
+      day_change_abs: null,
       day_change_percent: null,
       source: "coingecko",
-      source_error: `No price returned for coin_id ${asset.coin_id}`
+      source_error: `No price returned for coin_id ${asset.coin_id}`,
+      last_updated_at: null
     };
   }
 
   return {
-    price: toNumber(data.usd),
-    day_change_percent: data.usd_24h_change === null ? null : toNumber(data.usd_24h_change),
-    last_updated_at: data.last_updated_at || null,
+    price: toNumberOrNull(data.usd),
+    previous_close: null,
+    day_change_abs: null,
+    day_change_percent: toNumberOrNull(data.usd_24h_change),
     source: "coingecko",
-    source_error: null
+    source_error: null,
+    last_updated_at: data.last_updated_at || null
   };
 }
 
@@ -66,7 +106,8 @@ async function getFinnhubQuote(asset) {
       day_change_abs: null,
       day_change_percent: null,
       source: "finnhub",
-      source_error: "Missing FINNHUB_API_KEY"
+      source_error: "Missing FINNHUB_API_KEY",
+      last_updated_at: null
     };
   }
 
@@ -77,7 +118,8 @@ async function getFinnhubQuote(asset) {
       day_change_abs: null,
       day_change_percent: null,
       source: "finnhub",
-      source_error: "Missing symbol"
+      source_error: "Missing symbol",
+      last_updated_at: null
     };
   }
 
@@ -93,68 +135,86 @@ async function getFinnhubQuote(asset) {
 
   const data = response.data || {};
 
-  if (!data.c || data.c === 0) {
+  const price = toNumberOrNull(data.c);
+
+  if (price === null || price === 0) {
     return {
       price: null,
-      previous_close: data.pc ?? null,
-      day_change_abs: data.d ?? null,
-      day_change_percent: data.dp ?? null,
+      previous_close: toNumberOrNull(data.pc),
+      day_change_abs: toNumberOrNull(data.d),
+      day_change_percent: toNumberOrNull(data.dp),
       source: "finnhub",
-      source_error: `No valid quote returned for symbol ${asset.symbol}`
+      source_error: `No valid quote returned for symbol ${asset.symbol}`,
+      last_updated_at: data.t || null
     };
   }
 
   return {
-    price: toNumber(data.c),
-    previous_close: data.pc === undefined ? null : toNumber(data.pc),
-    day_change_abs: data.d === undefined ? null : toNumber(data.d),
-    day_change_percent: data.dp === undefined ? null : toNumber(data.dp),
+    price,
+    previous_close: toNumberOrNull(data.pc),
+    day_change_abs: toNumberOrNull(data.d),
+    day_change_percent: toNumberOrNull(data.dp),
     source: "finnhub",
-    source_error: null
+    source_error: null,
+    last_updated_at: data.t || null
   };
 }
 
 async function getManualPrice(asset) {
   return {
-    price: toNumber(asset.manual_value),
+    price: toNumberOrNull(asset.manual_value),
     previous_close: null,
     day_change_abs: 0,
     day_change_percent: 0,
     source: "manual",
-    source_error: null
+    source_error: null,
+    last_updated_at: null
   };
 }
 
 async function getMarketData(asset) {
+  const cached = getCached(asset);
+  if (cached) return cached;
+
   try {
+    let data;
+
     if (asset.type === "crypto") {
-      return await getCryptoPrice(asset);
+      data = await getCryptoPrice(asset);
+    } else if (asset.type === "stock" || asset.type === "etf") {
+      data = await getFinnhubQuote(asset);
+    } else if (asset.type === "manual") {
+      data = await getManualPrice(asset);
+    } else {
+      data = {
+        price: null,
+        previous_close: null,
+        day_change_abs: null,
+        day_change_percent: null,
+        source: null,
+        source_error: `Unsupported asset type: ${asset.type}`,
+        last_updated_at: null
+      };
     }
 
-    if (asset.type === "stock" || asset.type === "etf") {
-      return await getFinnhubQuote(asset);
+    if (!data.source_error && data.price !== null) {
+      setCached(asset, data);
     }
 
-    if (asset.type === "manual") {
-      return await getManualPrice(asset);
-    }
-
-    return {
-      price: null,
-      previous_close: null,
-      day_change_abs: null,
-      day_change_percent: null,
-      source: null,
-      source_error: `Unsupported asset type: ${asset.type}`
-    };
+    return data;
   } catch (err) {
+    const status = err.response?.status || null;
+
     return {
       price: null,
       previous_close: null,
       day_change_abs: null,
       day_change_percent: null,
-      source: null,
-      source_error: err.message
+      source: asset.type === "crypto" ? "coingecko" : "finnhub",
+      source_error: status
+        ? `Request failed with status code ${status}`
+        : err.message,
+      last_updated_at: null
     };
   }
 }
@@ -170,7 +230,7 @@ router.get("/", async (req, res) => {
 
     const enrichedAssets = await Promise.all(
       result.rows.map(async (asset) => {
-        const quantity = toNumber(asset.quantity);
+        const quantity = quantityToNumber(asset.quantity);
         const market = await getMarketData(asset);
 
         const price = market.price;
@@ -180,7 +240,11 @@ router.get("/", async (req, res) => {
 
         if (market.day_change_abs !== null && market.day_change_abs !== undefined) {
           dayChangeValue = market.day_change_abs * quantity;
-        } else if (value !== null && market.day_change_percent !== null && market.day_change_percent !== undefined) {
+        } else if (
+          value !== null &&
+          market.day_change_percent !== null &&
+          market.day_change_percent !== undefined
+        ) {
           dayChangeValue = value * (market.day_change_percent / 100);
         }
 
@@ -192,7 +256,7 @@ router.get("/", async (req, res) => {
           symbol: asset.symbol,
           coin_id: asset.coin_id,
           quantity,
-          manual_value: asset.manual_value === null ? null : toNumber(asset.manual_value),
+          manual_value: asset.manual_value === null ? null : toNumberOrNull(asset.manual_value),
 
           price: round(price, 4),
           value: round(value, 2),
@@ -216,7 +280,9 @@ router.get("/", async (req, res) => {
     }, 0);
 
     const totalDayChangePercent =
-      totalValue > 0 ? (totalDayChangeValue / (totalValue - totalDayChangeValue)) * 100 : null;
+      totalValue > 0 && totalValue - totalDayChangeValue !== 0
+        ? (totalDayChangeValue / (totalValue - totalDayChangeValue)) * 100
+        : null;
 
     res.json({
       user_id: Number(userId),
