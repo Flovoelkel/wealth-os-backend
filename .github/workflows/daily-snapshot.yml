@@ -14,24 +14,53 @@ jobs:
         env:
           ADMIN_DASHBOARD_TOKEN: ${{ secrets.ADMIN_DASHBOARD_TOKEN }}
         run: |
-          set -e
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.parse
+          import urllib.request
+          import urllib.error
 
-          echo "Calling Wealth OS snapshot endpoint..."
+          base_url = "https://wealth-os-backend-kheh.onrender.com/api/portfolio-snapshots/capture"
 
-          RESPONSE_FILE=$(mktemp)
+          token = os.environ.get("ADMIN_DASHBOARD_TOKEN", "").strip()
 
-          STATUS_CODE=$(curl -sS \
-            -o "$RESPONSE_FILE" \
-            -w "%{http_code}" \
-            --request POST "https://wealth-os-backend-kheh.onrender.com/api/portfolio-snapshots/capture" \
-            --header "Content-Type: application/json" \
-            --header "x-admin-token: ${ADMIN_DASHBOARD_TOKEN}" \
-            --data '{"user_id":1}')
+          if not token:
+              print("ADMIN_DASHBOARD_TOKEN is missing")
+              sys.exit(1)
 
-          echo "HTTP status: $STATUS_CODE"
-          echo "Response:"
-          cat "$RESPONSE_FILE"
+          params = urllib.parse.urlencode({
+              "user_id": 1,
+              "admin_token": token
+          })
 
-          if [ "$STATUS_CODE" -ge 400 ]; then
-            exit 1
-          fi
+          url = base_url + "?" + params
+
+          request = urllib.request.Request(
+              url,
+              data=b"",
+              method="POST"
+          )
+
+          try:
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  body = response.read().decode("utf-8")
+                  print("HTTP status:", response.status)
+                  print("Response:")
+                  print(body)
+
+                  if response.status >= 400:
+                      sys.exit(1)
+
+          except urllib.error.HTTPError as error:
+              body = error.read().decode("utf-8", errors="replace")
+              print("HTTP status:", error.code)
+              print("Response:")
+              print(body)
+              sys.exit(1)
+
+          except Exception as error:
+              print("Snapshot request failed:", repr(error))
+              sys.exit(1)
+          PY
