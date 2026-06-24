@@ -9,6 +9,7 @@ app.use(express.json());
 const portfolioRoutes = require("./routes/portfolio");
 const refreshPricesRoutes = require("./routes/refresh-prices");
 const assetUpdateRoutes = require("./routes/assets-update");
+const assetCreateRoutes = require("./routes/assets-create");
 
 function requireDashboardToken(req, res, next) {
   const expectedToken = process.env.PUBLIC_DASHBOARD_TOKEN;
@@ -33,6 +34,7 @@ function requireDashboardToken(req, res, next) {
 app.use("/api/portfolio", requireDashboardToken, portfolioRoutes);
 app.use("/api/refresh-prices", requireDashboardToken, refreshPricesRoutes);
 app.use("/api/assets/update", assetUpdateRoutes);
+app.use("/api/assets/create", assetCreateRoutes);
 
 app.get("/", (req, res) => {
   res.json({ status: "wealth-os online" });
