@@ -317,90 +317,95 @@ function enrichAsset(asset, priceMap, fxMap, forcedMode = null, syntheticOverrid
   };
 }
 
+async function buildPortfolioResponse(userIdInput = 1) {
+  const userId = Number(userIdInput || 1);
+
+  const assetsResult = await db.query(
+    "SELECT * FROM assets WHERE user_id = $1 ORDER BY id ASC",
+    [userId]
+  );
+
+  const pricesResult = await db.query("SELECT * FROM market_prices");
+  const fxResult = await db.query("SELECT * FROM fx_rates");
+
+  const priceMap = new Map();
+  for (const row of pricesResult.rows) {
+    priceMap.set(getMarketKey(row.provider, row.symbol), row);
+  }
+
+  const fxMap = new Map();
+  for (const row of fxResult.rows) {
+    fxMap.set(`${row.base}:${row.quote}`, row.rate);
+  }
+  fxMap.set("EUR:EUR", 1);
+
+  const enrichedAssets = assetsResult.rows.map((asset) => enrichAsset(asset, priceMap, fxMap));
+
+  const portfolioAssets = enrichedAssets.filter((asset) => asset.mode === "portfolio");
+  const originalWatchlistAssets = enrichedAssets.filter((asset) => asset.mode === "watchlist");
+
+  const targetGapAssets = [];
+
+  for (const asset of portfolioAssets) {
+    const targetValue = toNumberOrNull(asset.target_value);
+    const currentValue = toNumberOrNull(asset.value);
+
+    if (targetValue !== null && currentValue !== null && targetValue > currentValue) {
+      const gapValue = targetValue - currentValue;
+      const dayChangeValue =
+        asset.day_change_percent !== null && asset.day_change_percent !== undefined
+          ? gapValue * (asset.day_change_percent / 100)
+          : 0;
+
+      const syntheticAsset = {
+        ...asset,
+        id: `gap-${asset.id}`,
+        mode: "watchlist",
+        name: `${asset.name} Ziel-Lücke`,
+        value: round(gapValue, 2),
+        day_change_value: round(dayChangeValue, 2),
+        valuation_method: "target_gap",
+        is_synthetic: true,
+        base_asset_id: asset.id,
+        manual_value: null,
+        quantity: 0
+      };
+
+      syntheticAsset.market_direction = getMarketDirection(
+        syntheticAsset.day_change_value,
+        syntheticAsset.day_change_percent
+      );
+      syntheticAsset.display_color = getDisplayColor("watchlist", syntheticAsset.market_direction);
+
+      targetGapAssets.push(syntheticAsset);
+    }
+  }
+
+  const watchlistAssets = [...originalWatchlistAssets, ...targetGapAssets];
+
+  const portfolio = summarizeAssets(portfolioAssets);
+  const watchlist = summarizeAssets(watchlistAssets);
+
+  return {
+    engine_version: ENGINE_VERSION,
+    user_id: Number(userId),
+    currency: "EUR",
+    total_value: portfolio.total_value,
+    total_day_change_value: portfolio.total_day_change_value,
+    total_day_change_percent: portfolio.total_day_change_percent,
+    portfolio,
+    watchlist,
+    target_gaps: {
+      count: targetGapAssets.length,
+      total_value: round(targetGapAssets.reduce((sum, asset) => sum + (asset.value || 0), 0), 2)
+    }
+  };
+}
+
 router.get("/", async (req, res) => {
   try {
-    const userId = req.query.user_id || 1;
-
-    const assetsResult = await db.query(
-      "SELECT * FROM assets WHERE user_id = $1 ORDER BY id ASC",
-      [userId]
-    );
-
-    const pricesResult = await db.query("SELECT * FROM market_prices");
-    const fxResult = await db.query("SELECT * FROM fx_rates");
-
-    const priceMap = new Map();
-    for (const row of pricesResult.rows) {
-      priceMap.set(getMarketKey(row.provider, row.symbol), row);
-    }
-
-    const fxMap = new Map();
-    for (const row of fxResult.rows) {
-      fxMap.set(`${row.base}:${row.quote}`, row.rate);
-    }
-    fxMap.set("EUR:EUR", 1);
-
-    const enrichedAssets = assetsResult.rows.map((asset) => enrichAsset(asset, priceMap, fxMap));
-
-    const portfolioAssets = enrichedAssets.filter((asset) => asset.mode === "portfolio");
-    const originalWatchlistAssets = enrichedAssets.filter((asset) => asset.mode === "watchlist");
-
-    const targetGapAssets = [];
-
-    for (const asset of portfolioAssets) {
-      const targetValue = toNumberOrNull(asset.target_value);
-      const currentValue = toNumberOrNull(asset.value);
-
-      if (targetValue !== null && currentValue !== null && targetValue > currentValue) {
-        const gapValue = targetValue - currentValue;
-        const dayChangeValue =
-          asset.day_change_percent !== null && asset.day_change_percent !== undefined
-            ? gapValue * (asset.day_change_percent / 100)
-            : 0;
-
-        const syntheticAsset = {
-          ...asset,
-          id: `gap-${asset.id}`,
-          mode: "watchlist",
-          name: `${asset.name} Ziel-Lücke`,
-          value: round(gapValue, 2),
-          day_change_value: round(dayChangeValue, 2),
-          valuation_method: "target_gap",
-          is_synthetic: true,
-          base_asset_id: asset.id,
-          manual_value: null,
-          quantity: 0
-        };
-
-        syntheticAsset.market_direction = getMarketDirection(
-          syntheticAsset.day_change_value,
-          syntheticAsset.day_change_percent
-        );
-        syntheticAsset.display_color = getDisplayColor("watchlist", syntheticAsset.market_direction);
-
-        targetGapAssets.push(syntheticAsset);
-      }
-    }
-
-    const watchlistAssets = [...originalWatchlistAssets, ...targetGapAssets];
-
-    const portfolio = summarizeAssets(portfolioAssets);
-    const watchlist = summarizeAssets(watchlistAssets);
-
-    res.json({
-      engine_version: ENGINE_VERSION,
-      user_id: Number(userId),
-      currency: "EUR",
-      total_value: portfolio.total_value,
-      total_day_change_value: portfolio.total_day_change_value,
-      total_day_change_percent: portfolio.total_day_change_percent,
-      portfolio,
-      watchlist,
-      target_gaps: {
-        count: targetGapAssets.length,
-        total_value: round(targetGapAssets.reduce((sum, asset) => sum + (asset.value || 0), 0), 2)
-      }
-    });
+    const payload = await buildPortfolioResponse(req.query.user_id || 1);
+    res.json(payload);
   } catch (err) {
     console.error(err);
     res.status(500).json({
@@ -411,3 +416,4 @@ router.get("/", async (req, res) => {
 });
 
 module.exports = router;
+module.exports.buildPortfolioResponse = buildPortfolioResponse;
