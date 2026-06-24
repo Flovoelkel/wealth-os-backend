@@ -12,10 +12,10 @@ jobs:
     steps:
       - name: Capture portfolio snapshot
         run: |
-          curl --fail --silent --show-error \
+          curl -i \
             -X POST "https://wealth-os-backend-kheh.onrender.com/api/portfolio-snapshots/capture" \
             -H "Content-Type: application/json" \
             -H "x-admin-token: ${ADMIN_DASHBOARD_TOKEN}" \
             -d '{"user_id":1}'
-        env:
+                env:
           ADMIN_DASHBOARD_TOKEN: ${{ secrets.ADMIN_DASHBOARD_TOKEN }}
