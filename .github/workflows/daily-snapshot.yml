@@ -15,6 +15,7 @@ jobs:
           curl --fail --silent --show-error \
             -X POST "https://wealth-os-backend-kheh.onrender.com/api/portfolio-snapshots/capture" \
             -H "Content-Type: application/json" \
-            -d '{"admin_token":"'"${ADMIN_DASHBOARD_TOKEN}"'","user_id":1}'
+            -H "x-admin-token: ${ADMIN_DASHBOARD_TOKEN}" \
+            -d '{"user_id":1}'
         env:
           ADMIN_DASHBOARD_TOKEN: ${{ secrets.ADMIN_DASHBOARD_TOKEN }}
