@@ -1,0 +1,20 @@
+name: Daily Wealth OS Snapshot
+
+on:
+  schedule:
+    - cron: "55 22 * * *"
+  workflow_dispatch:
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Capture portfolio snapshot
+        run: |
+          curl --fail --silent --show-error \
+            -X POST "https://wealth-os-backend-kheh.onrender.com/api/portfolio-snapshots/capture" \
+            -H "Content-Type: application/json" \
+            -d '{"admin_token":"'"${ADMIN_DASHBOARD_TOKEN}"'","user_id":1}'
+        env:
+          ADMIN_DASHBOARD_TOKEN: ${{ secrets.ADMIN_DASHBOARD_TOKEN }}
