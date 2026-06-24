@@ -1,15 +1,13 @@
 const router = require("express").Router();
 const db = require("../db");
 
-const UPDATE_VERSION = "asset-update-v1.6";
+const UPDATE_VERSION = "asset-update-v1.8-mode-move";
 
 function requireAdminToken(req, res, next) {
   const expectedToken = process.env.ADMIN_DASHBOARD_TOKEN;
 
   if (!expectedToken) {
-    return res.status(500).json({
-      error: "ADMIN_DASHBOARD_TOKEN is not configured"
-    });
+    return res.status(500).json({ error: "ADMIN_DASHBOARD_TOKEN is not configured" });
   }
 
   const providedToken =
@@ -28,25 +26,43 @@ function optionalNumber(value) {
   if (value === undefined) return undefined;
   if (value === null || value === "") return null;
   const n = Number(value);
-  if (!Number.isFinite(n)) {
-    throw new Error(`Invalid numeric value: ${value}`);
-  }
+  if (!Number.isFinite(n)) throw new Error(`Invalid numeric value: ${value}`);
   return n;
 }
 
 function optionalText(value) {
   if (value === undefined) return undefined;
   if (value === null || value === "") return null;
-  return String(value).trim();
+  const trimmed = String(value).trim();
+  return trimmed === "" ? null : trimmed;
 }
 
 function optionalBoolean(value) {
   if (value === undefined) return undefined;
   if (value === null || value === "") return null;
   if (typeof value === "boolean") return value;
-  if (String(value).toLowerCase() === "true") return true;
-  if (String(value).toLowerCase() === "false") return false;
+  const normalized = String(value).toLowerCase().trim();
+  if (["true", "1", "yes", "ja"].includes(normalized)) return true;
+  if (["false", "0", "no", "nein"].includes(normalized)) return false;
   throw new Error(`Invalid boolean value: ${value}`);
+}
+
+function optionalEnum(value, allowed, fieldName) {
+  const parsed = optionalText(value);
+  if (parsed === undefined || parsed === null) return parsed;
+  if (!allowed.includes(parsed)) {
+    throw new Error(`${fieldName} must be one of: ${allowed.join(", ")}`);
+  }
+  return parsed;
+}
+
+function parseProvider(value) {
+  const parsed = optionalText(value);
+  if (parsed === undefined || parsed === null || parsed === "manual") return null;
+  if (!["finnhub", "coingecko", "twelvedata"].includes(parsed)) {
+    throw new Error("data_provider must be finnhub, coingecko, twelvedata or empty/manual");
+  }
+  return parsed;
 }
 
 router.post("/", requireAdminToken, async (req, res) => {
@@ -59,14 +75,23 @@ router.post("/", requireAdminToken, async (req, res) => {
     }
 
     const allowed = {
+      name: optionalText,
+      mode: (v) => optionalEnum(v, ["portfolio", "watchlist"], "mode"),
+      type: (v) => optionalEnum(v, ["stock", "etf", "crypto", "manual"], "type"),
       quantity: optionalNumber,
       manual_value: optionalNumber,
       target_value: optionalNumber,
-      price_currency: optionalText,
+      price_currency: (v) => {
+        const parsed = optionalText(v);
+        return parsed === undefined || parsed === null ? parsed : String(parsed).toUpperCase();
+      },
       symbol: optionalText,
       provider_symbol: optionalText,
-      data_provider: optionalText,
+      coin_id: optionalText,
+      data_provider: parseProvider,
       live_enabled: optionalBoolean,
+      provider_mic_code: optionalText,
+      provider_exchange: optionalText,
       notes_internal: optionalText
     };
 
