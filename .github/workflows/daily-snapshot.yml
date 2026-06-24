@@ -14,7 +14,24 @@ jobs:
         env:
           ADMIN_DASHBOARD_TOKEN: ${{ secrets.ADMIN_DASHBOARD_TOKEN }}
         run: |
-          curl -i \
-            -X POST "https://wealth-os-backend-kheh.onrender.com/api/portfolio-snapshots/capture?user_id=1&admin_token=${ADMIN_DASHBOARD_TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d '{}'
+          set -e
+
+          echo "Calling Wealth OS snapshot endpoint..."
+
+          RESPONSE_FILE=$(mktemp)
+
+          STATUS_CODE=$(curl -sS \
+            -o "$RESPONSE_FILE" \
+            -w "%{http_code}" \
+            --request POST "https://wealth-os-backend-kheh.onrender.com/api/portfolio-snapshots/capture" \
+            --header "Content-Type: application/json" \
+            --header "x-admin-token: ${ADMIN_DASHBOARD_TOKEN}" \
+            --data '{"user_id":1}')
+
+          echo "HTTP status: $STATUS_CODE"
+          echo "Response:"
+          cat "$RESPONSE_FILE"
+
+          if [ "$STATUS_CODE" -ge 400 ]; then
+            exit 1
+          fi
