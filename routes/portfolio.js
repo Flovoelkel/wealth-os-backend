@@ -1,7 +1,7 @@
 const router = require("express").Router();
 const db = require("../db");
 
-const ENGINE_VERSION = "price-engine-v1.6-quantity-target-fx";
+const ENGINE_VERSION = "price-engine-v2.0-target-gaps-owned-needed";
 
 function toNumberOrNull(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -341,8 +341,30 @@ async function buildPortfolioResponse(userIdInput = 1) {
 
   const enrichedAssets = assetsResult.rows.map((asset) => enrichAsset(asset, priceMap, fxMap));
 
-  const portfolioAssets = enrichedAssets.filter((asset) => asset.mode === "portfolio");
-  const originalWatchlistAssets = enrichedAssets.filter((asset) => asset.mode === "watchlist");
+  const normalizedAssets = enrichedAssets.map((asset) => {
+    const hasOwnedQuantity = quantityToNumber(asset.quantity) > 0;
+
+    if (asset.mode === "watchlist" && hasOwnedQuantity) {
+      const marketDirection = getMarketDirection(asset.day_change_value, asset.day_change_percent);
+
+      return {
+        ...asset,
+        mode: "portfolio",
+        original_mode: "watchlist",
+        promoted_to_portfolio_by_quantity: true,
+        display_color: getDisplayColor("portfolio", marketDirection)
+      };
+    }
+
+    return {
+      ...asset,
+      original_mode: asset.mode,
+      promoted_to_portfolio_by_quantity: false
+    };
+  });
+
+  const portfolioAssets = normalizedAssets.filter((asset) => asset.mode === "portfolio");
+  const originalWatchlistAssets = normalizedAssets.filter((asset) => asset.mode === "watchlist");
 
   const targetGapAssets = [];
 
@@ -352,6 +374,11 @@ async function buildPortfolioResponse(userIdInput = 1) {
 
     if (targetValue !== null && currentValue !== null && targetValue > currentValue) {
       const gapValue = targetValue - currentValue;
+      const ownedQuantity = quantityToNumber(asset.quantity);
+      const unitPrice = toNumberOrNull(asset.price);
+      const neededQuantity = unitPrice !== null && unitPrice > 0 ? gapValue / unitPrice : null;
+      const targetCompletionPercent = targetValue > 0 ? (currentValue / targetValue) * 100 : null;
+
       const dayChangeValue =
         asset.day_change_percent !== null && asset.day_change_percent !== undefined
           ? gapValue * (asset.day_change_percent / 100)
@@ -361,14 +388,24 @@ async function buildPortfolioResponse(userIdInput = 1) {
         ...asset,
         id: `gap-${asset.id}`,
         mode: "watchlist",
-        name: `${asset.name} Ziel-Lücke`,
+        original_mode: asset.original_mode || asset.mode,
+        name: `${asset.name} Nachkauf`,
         value: round(gapValue, 2),
         day_change_value: round(dayChangeValue, 2),
         valuation_method: "target_gap",
         is_synthetic: true,
         base_asset_id: asset.id,
         manual_value: null,
-        quantity: 0
+        quantity: 0,
+
+        owned_quantity: round(ownedQuantity, 6),
+        owned_value: round(currentValue, 2),
+        needed_quantity: round(neededQuantity, 6),
+        needed_value: round(gapValue, 2),
+        target_gap_quantity: round(neededQuantity, 6),
+        target_gap_value: round(gapValue, 2),
+        target_completion_percent: round(targetCompletionPercent, 4),
+        target_value: round(targetValue, 2)
       };
 
       syntheticAsset.market_direction = getMarketDirection(
@@ -397,7 +434,20 @@ async function buildPortfolioResponse(userIdInput = 1) {
     watchlist,
     target_gaps: {
       count: targetGapAssets.length,
-      total_value: round(targetGapAssets.reduce((sum, asset) => sum + (asset.value || 0), 0), 2)
+      total_value: round(targetGapAssets.reduce((sum, asset) => sum + (asset.value || 0), 0), 2),
+      total_needed_value: round(targetGapAssets.reduce((sum, asset) => sum + (asset.needed_value || 0), 0), 2)
+    },
+    portfolio_rules: {
+      quantity_gt_zero_is_portfolio: true,
+      portfolio_assets_with_target_gap_also_appear_in_watchlist: true,
+      watchlist_target_gap_fields: [
+        "owned_value",
+        "owned_quantity",
+        "needed_value",
+        "needed_quantity",
+        "target_value",
+        "target_completion_percent"
+      ]
     }
   };
 }
