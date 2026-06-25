@@ -29,27 +29,16 @@ function requireDashboardToken(req, res, next) {
   next();
 }
 
-/**
- * Wichtig:
- * Spezifische Routen zuerst registrieren.
- * Danach allgemeine Routen wie /api/portfolio und /api/refresh-prices.
- */
-app.use("/api/portfolio-snapshots", portfolioSnapshotsRoutes);
-app.use("/api/assets/search", assetSymbolSearchRoutes);
-app.use("/api/assets/update", assetUpdateRoutes);
-app.use("/api/assets/create", assetCreateRoutes);
 app.use("/api/portfolio", requireDashboardToken, portfolioRoutes);
 app.use("/api/refresh-prices", requireDashboardToken, refreshPricesRoutes);
+app.use("/api/assets/update", assetUpdateRoutes);
+app.use("/api/assets/create", assetCreateRoutes);
+app.use("/api/portfolio-snapshots", portfolioSnapshotsRoutes);
+app.use("/api/assets/search", assetSymbolSearchRoutes);
 
 app.get("/", (req, res) => {
-  res.json({
-    status: "wealth-os online",
-    version: "v1.8-snapshots-admin-polish"
-  });
+  res.json({ status: "wealth-os online", version: "v2.0-target-gaps-owned-needed" });
 });
 
 const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-  console.log("Server running on " + PORT);
-});
+app.listen(PORT, () => console.log("Server running on " + PORT));
