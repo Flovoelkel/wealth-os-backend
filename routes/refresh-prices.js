@@ -410,7 +410,7 @@ async function getRefreshCandidates(userId, limit, staleMinutes, providerFilter)
   return result.rows;
 }
 
-router.get("/", async (req, res) => {
+async function handleRefreshPrices(req, res) {
   const startedAt = Date.now();
 
   try {
@@ -485,6 +485,9 @@ router.get("/", async (req, res) => {
       details: err.message
     });
   }
-});
+}
+
+router.get("/", handleRefreshPrices);
 
 module.exports = router;
+module.exports.handleRefreshPrices = handleRefreshPrices;
