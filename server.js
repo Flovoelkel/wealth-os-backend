@@ -51,7 +51,7 @@ app.use("/api/portfolio-snapshots", portfolioSnapshotsRoutes);
 app.use("/api/assets/search", assetSymbolSearchRoutes);
 
 app.get("/", (req, res) => {
-  res.json({ status: "wealth-os online", version: "v3.0-multi-user-login" });
+  res.json({ status: "wealth-os online", version: "v3.2-alternative-assets-vehicles-real-estate-irr" });
 });
 
 const PORT = process.env.PORT || 3000;
