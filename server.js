@@ -3,8 +3,14 @@ const cors = require("cors");
 
 const app = express();
 
-app.use(cors());
+app.use(cors({ origin: true, credentials: false }));
 app.use(express.json({ limit: "2mb" }));
+
+const authRoutes = require("./routes/auth");
+const mePortfolioRoutes = require("./routes/me-portfolio");
+const meRefreshPricesRoutes = require("./routes/me-refresh-prices");
+const mePortfolioSnapshotsRoutes = require("./routes/me-portfolio-snapshots");
+const meAssetsRoutes = require("./routes/me-assets");
 
 const portfolioRoutes = require("./routes/portfolio");
 const refreshPricesRoutes = require("./routes/refresh-prices");
@@ -29,6 +35,14 @@ function requireDashboardToken(req, res, next) {
   next();
 }
 
+// Authenticated user-facing routes. These should be used by fvoelkel.com/portfolio-dashboard.
+app.use("/api/auth", authRoutes);
+app.use("/api/me/portfolio", mePortfolioRoutes);
+app.use("/api/me/refresh-prices", meRefreshPricesRoutes);
+app.use("/api/me/portfolio-snapshots", mePortfolioSnapshotsRoutes);
+app.use("/api/me/assets", meAssetsRoutes);
+
+// Legacy routes remain available for the old one-user public/admin setup and automation compatibility.
 app.use("/api/portfolio", requireDashboardToken, portfolioRoutes);
 app.use("/api/refresh-prices", requireDashboardToken, refreshPricesRoutes);
 app.use("/api/assets/update", assetUpdateRoutes);
@@ -37,7 +51,7 @@ app.use("/api/portfolio-snapshots", portfolioSnapshotsRoutes);
 app.use("/api/assets/search", assetSymbolSearchRoutes);
 
 app.get("/", (req, res) => {
-  res.json({ status: "wealth-os online", version: "v2.0-target-gaps-owned-needed" });
+  res.json({ status: "wealth-os online", version: "v3.0-multi-user-login" });
 });
 
 const PORT = process.env.PORT || 3000;
