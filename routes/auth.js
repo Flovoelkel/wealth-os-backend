@@ -3,7 +3,7 @@ const bcrypt = require("bcryptjs");
 const db = require("../db");
 const { requireAuth, signUserToken } = require("../middleware/auth");
 
-const AUTH_VERSION = "auth-v3.0-multi-user";
+const AUTH_VERSION = "auth-v3.0.1-multi-user-password-8";
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 function cleanEmail(value) {
