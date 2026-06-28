@@ -18,8 +18,8 @@ function cleanText(value, fallback = null) {
 
 function validatePassword(password) {
   const text = String(password || "");
-  if (text.length < 10) {
-    throw new Error("Passwort muss mindestens 10 Zeichen haben.");
+  if (text.length < 8) {
+    throw new Error("Passwort muss mindestens 8 Zeichen haben.");
   }
   return text;
 }
