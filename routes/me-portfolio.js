@@ -15,7 +15,7 @@ router.get("/", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ error: "Authenticated portfolio error", details: err.message });
+    res.status(500).json({ error: "Das Portfolio konnte nicht geladen werden.", code: "PORTFOLIO_LOAD_FAILED" });
   }
 });
 
