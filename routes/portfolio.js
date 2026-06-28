@@ -1,7 +1,7 @@
 const router = require("express").Router();
 const db = require("../db");
 
-const ENGINE_VERSION = "price-engine-v2.1-allocation-metadata";
+const ENGINE_VERSION = "price-engine-v3.2-alternative-assets-irr";
 
 function toNumberOrNull(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -18,6 +18,248 @@ function round(value, decimals = 2) {
   const n = toNumberOrNull(value);
   if (n === null) return null;
   return Number(n.toFixed(decimals));
+}
+
+
+function parseAssetDetails(value) {
+  if (!value) return {};
+  if (typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch (_) {
+      return {};
+    }
+  }
+  return {};
+}
+
+function numberFromDetails(details, keys, fallback = null) {
+  for (const key of keys) {
+    const value = toNumberOrNull(details?.[key]);
+    if (value !== null) return value;
+  }
+  return fallback;
+}
+
+function textFromDetails(details, keys, fallback = null) {
+  for (const key of keys) {
+    const value = details?.[key];
+    if (value !== null && value !== undefined && String(value).trim() !== "") return String(value).trim();
+  }
+  return fallback;
+}
+
+function calculateMonthlyPayment(principal, annualRatePercent, months) {
+  const p = toNumberOrNull(principal);
+  const m = Math.max(0, Math.round(toNumberOrNull(months) || 0));
+  if (p === null || p <= 0 || m <= 0) return null;
+
+  const annualRate = (toNumberOrNull(annualRatePercent) || 0) / 100;
+  const monthlyRate = annualRate / 12;
+
+  if (monthlyRate === 0) return p / m;
+  return p * monthlyRate / (1 - Math.pow(1 + monthlyRate, -m));
+}
+
+function calculateRemainingBalance(principal, annualRatePercent, monthlyPayment, elapsedMonths) {
+  let balance = toNumberOrNull(principal);
+  const payment = toNumberOrNull(monthlyPayment);
+  const months = Math.max(0, Math.round(toNumberOrNull(elapsedMonths) || 0));
+
+  if (balance === null || balance <= 0) return 0;
+  if (payment === null || payment <= 0 || months <= 0) return balance;
+
+  const monthlyRate = ((toNumberOrNull(annualRatePercent) || 0) / 100) / 12;
+  const cappedMonths = Math.min(months, 1200);
+
+  for (let i = 0; i < cappedMonths; i++) {
+    balance = balance * (1 + monthlyRate) - payment;
+    if (balance <= 0) return 0;
+  }
+
+  return balance;
+}
+
+function calculateIrr(cashFlows) {
+  const flows = (cashFlows || []).map(Number).filter((value) => Number.isFinite(value));
+  const hasPositive = flows.some((value) => value > 0);
+  const hasNegative = flows.some((value) => value < 0);
+  if (!flows.length || !hasPositive || !hasNegative) return null;
+
+  function npv(rate) {
+    return flows.reduce((sum, cashFlow, index) => sum + cashFlow / Math.pow(1 + rate, index), 0);
+  }
+
+  let low = -0.9999;
+  let high = 1;
+  let lowValue = npv(low);
+  let highValue = npv(high);
+
+  // Expand upper bound for unusual high-return scenarios.
+  let expansions = 0;
+  while (lowValue * highValue > 0 && expansions < 12) {
+    high *= 2;
+    highValue = npv(high);
+    expansions++;
+  }
+
+  if (lowValue * highValue > 0) return null;
+
+  for (let i = 0; i < 120; i++) {
+    const mid = (low + high) / 2;
+    const midValue = npv(mid);
+    if (Math.abs(midValue) < 0.000001) return mid;
+    if (lowValue * midValue <= 0) {
+      high = mid;
+      highValue = midValue;
+    } else {
+      low = mid;
+      lowValue = midValue;
+    }
+  }
+
+  return (low + high) / 2;
+}
+
+function buildVehicleMetrics(asset) {
+  const assetDetails = parseAssetDetails(asset.asset_details);
+  const details = assetDetails.vehicle || assetDetails;
+
+  const currentValue = numberFromDetails(details, ["current_estimated_value", "current_value", "market_value"], toNumberOrNull(asset.manual_value));
+  const purchasePrice = numberFromDetails(details, ["purchase_price", "acquisition_cost"]);
+  const annualGrowthPercent = numberFromDetails(details, ["annual_value_growth_percent", "projected_annual_growth_percent", "annual_appreciation_percent"], 0);
+  const projectionYears = numberFromDetails(details, ["projection_years", "holding_years"], 0);
+  const projectedValue =
+    currentValue !== null && projectionYears && Number.isFinite(projectionYears)
+      ? currentValue * Math.pow(1 + (annualGrowthPercent || 0) / 100, projectionYears)
+      : null;
+
+  if (currentValue === null) return null;
+
+  return {
+    value: currentValue,
+    dayChangeValue: 0,
+    valuationMethod: "vehicle_estimated_value",
+    computedMetrics: {
+      asset_kind: "vehicle",
+      purchase_date: textFromDetails(details, ["purchase_date"]),
+      purchase_price: round(purchasePrice, 2),
+      current_estimated_value: round(currentValue, 2),
+      annual_value_growth_percent: round(annualGrowthPercent, 4),
+      projection_years: round(projectionYears, 2),
+      projected_value: round(projectedValue, 2)
+    }
+  };
+}
+
+function buildRealEstateMetrics(asset) {
+  const assetDetails = parseAssetDetails(asset.asset_details);
+  const details = assetDetails.real_estate || assetDetails;
+
+  const manualValue = toNumberOrNull(asset.manual_value);
+  const currentPropertyValue = numberFromDetails(details, ["current_property_value", "current_value", "market_value", "property_value"], manualValue);
+  const equityPaid = numberFromDetails(details, ["equity_paid", "paid_equity", "paid_equity_value"], null);
+  const remainingDebt = numberFromDetails(details, ["remaining_debt", "remaining_value_to_pay", "remaining_to_pay", "loan_balance"], 0);
+  const purchasePrice = numberFromDetails(details, ["purchase_price", "acquisition_price"], null);
+  const annualGrowthPercent = numberFromDetails(details, ["annual_value_growth_percent", "projected_annual_growth_percent", "annual_appreciation_percent"], 0);
+  const holdingYears = numberFromDetails(details, ["holding_years", "projection_years"], 10);
+  const repaymentMonths = numberFromDetails(details, ["repayment_months", "payoff_months", "amortization_months"], null);
+  const financingRatePercent = numberFromDetails(details, ["financing_rate_percent", "interest_rate_percent", "loan_interest_percent"], 0);
+  const monthlyPaymentInput = numberFromDetails(details, ["monthly_payment", "monthly_debt_service"], null);
+  const monthlyRentIncome = numberFromDetails(details, ["monthly_rent_income", "monthly_income", "rent_income_monthly"], 0);
+  const monthlyOperatingCosts = numberFromDetails(details, ["monthly_operating_costs", "monthly_costs", "operating_costs_monthly"], 0);
+  const sellingCostPercent = numberFromDetails(details, ["selling_cost_percent", "transaction_cost_percent", "exit_cost_percent"], 0);
+
+  const calculatedMonthlyPayment =
+    monthlyPaymentInput !== null
+      ? monthlyPaymentInput
+      : calculateMonthlyPayment(remainingDebt, financingRatePercent, repaymentMonths);
+
+  const exitMonths = Math.max(1, Math.round((holdingYears || 0) * 12));
+  const paymentMonthsForCashflow = repaymentMonths === null ? exitMonths : Math.min(exitMonths, Math.max(0, Math.round(repaymentMonths)));
+  const projectedExitValue =
+    currentPropertyValue !== null
+      ? currentPropertyValue * Math.pow(1 + (annualGrowthPercent || 0) / 100, holdingYears || 0)
+      : null;
+
+  const futureDebtBalance = calculateRemainingBalance(
+    remainingDebt,
+    financingRatePercent,
+    calculatedMonthlyPayment,
+    exitMonths
+  );
+
+  const sellingCosts = projectedExitValue !== null ? projectedExitValue * ((sellingCostPercent || 0) / 100) : null;
+  const projectedNetExitProceeds =
+    projectedExitValue !== null ? projectedExitValue - (futureDebtBalance || 0) - (sellingCosts || 0) : null;
+
+  const currentEquityValue =
+    currentPropertyValue !== null
+      ? Math.max(0, currentPropertyValue - (remainingDebt || 0))
+      : equityPaid !== null
+        ? equityPaid
+        : manualValue;
+
+  const initialInvestment = equityPaid !== null && equityPaid > 0
+    ? equityPaid
+    : purchasePrice !== null && remainingDebt !== null
+      ? Math.max(0, purchasePrice - remainingDebt)
+      : null;
+
+  let irrMonthly = null;
+  let irrAnnualPercent = null;
+
+  if (initialInvestment !== null && initialInvestment > 0 && projectedNetExitProceeds !== null) {
+    const monthlyNetCashflow = (monthlyRentIncome || 0) - (monthlyOperatingCosts || 0);
+    const flows = [-initialInvestment];
+
+    for (let month = 1; month <= exitMonths; month++) {
+      const debtService = month <= paymentMonthsForCashflow ? (calculatedMonthlyPayment || 0) : 0;
+      flows.push(monthlyNetCashflow - debtService);
+    }
+
+    flows[flows.length - 1] += projectedNetExitProceeds;
+    irrMonthly = calculateIrr(flows);
+    irrAnnualPercent = irrMonthly === null ? null : (Math.pow(1 + irrMonthly, 12) - 1) * 100;
+  }
+
+  if (currentEquityValue === null) return null;
+
+  return {
+    value: currentEquityValue,
+    dayChangeValue: 0,
+    valuationMethod: "real_estate_equity_value",
+    computedMetrics: {
+      asset_kind: "real_estate",
+      purchase_date: textFromDetails(details, ["purchase_date"]),
+      purchase_price: round(purchasePrice, 2),
+      current_property_value: round(currentPropertyValue, 2),
+      equity_paid: round(equityPaid, 2),
+      remaining_debt: round(remainingDebt, 2),
+      current_equity_value: round(currentEquityValue, 2),
+      financing_rate_percent: round(financingRatePercent, 4),
+      repayment_months: repaymentMonths === null ? null : Math.round(repaymentMonths),
+      calculated_monthly_payment: round(calculatedMonthlyPayment, 2),
+      monthly_rent_income: round(monthlyRentIncome, 2),
+      monthly_operating_costs: round(monthlyOperatingCosts, 2),
+      annual_value_growth_percent: round(annualGrowthPercent, 4),
+      holding_years: round(holdingYears, 2),
+      projected_exit_value: round(projectedExitValue, 2),
+      future_debt_balance: round(futureDebtBalance, 2),
+      selling_cost_percent: round(sellingCostPercent, 4),
+      projected_net_exit_proceeds: round(projectedNetExitProceeds, 2),
+      irr_monthly: irrMonthly === null ? null : round(irrMonthly, 8),
+      irr_annual_percent: round(irrAnnualPercent, 4)
+    }
+  };
+}
+
+function calculateAlternativeAssetSnapshot(asset) {
+  if (asset.type === "vehicle") return buildVehicleMetrics(asset);
+  if (asset.type === "real_estate") return buildRealEstateMetrics(asset);
+  return null;
 }
 
 function getMarketKey(provider, symbol) {
@@ -212,6 +454,9 @@ function summarizeAssets(assets) {
 }
 
 function calculateValueAndChange(asset, market, quantity) {
+  const alternativeSnapshot = calculateAlternativeAssetSnapshot(asset);
+  if (alternativeSnapshot) return alternativeSnapshot;
+
   const manualValue = toNumberOrNull(asset.manual_value);
   const price = market.price;
 
@@ -268,6 +513,7 @@ function enrichAsset(asset, priceMap, fxMap, forcedMode = null, syntheticOverrid
   const mode = forcedMode || (asset.mode === "watchlist" ? "watchlist" : "portfolio");
   const market = getCachedMarket(asset, priceMap, fxMap);
   const valueResult = calculateValueAndChange(asset, market, quantity);
+  const assetDetails = parseAssetDetails(asset.asset_details);
 
   const roundedDayChangeValue = round(valueResult.dayChangeValue, 2);
   const roundedDayChangePercent = round(market.day_change_percent, 4);
@@ -294,6 +540,8 @@ function enrichAsset(asset, priceMap, fxMap, forcedMode = null, syntheticOverrid
     sector_block: asset.sector_block || null,
     region: asset.region || null,
     abcd_rating: asset.abcd_rating || null,
+    asset_details: assetDetails,
+    computed_metrics: valueResult.computedMetrics || null,
     quantity,
     manual_value: asset.manual_value === null ? null : toNumberOrNull(asset.manual_value),
     target_value: asset.target_value === null ? null : toNumberOrNull(asset.target_value),
@@ -463,6 +711,16 @@ async function buildPortfolioResponse(userIdInput = 1) {
         "sector_block",
         "region",
         "abcd_rating"
+      ],
+      alternative_asset_types: ["vehicle", "real_estate"],
+      real_estate_calculation_fields: [
+        "current_property_value",
+        "equity_paid",
+        "remaining_debt",
+        "current_equity_value",
+        "calculated_monthly_payment",
+        "projected_net_exit_proceeds",
+        "irr_annual_percent"
       ]
     }
   };
