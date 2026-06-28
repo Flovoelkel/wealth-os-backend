@@ -1,7 +1,7 @@
 const router = require("express").Router();
 const db = require("../db");
 
-const ENGINE_VERSION = "price-engine-v2.0-target-gaps-owned-needed";
+const ENGINE_VERSION = "price-engine-v2.1-allocation-metadata";
 
 function toNumberOrNull(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -286,6 +286,14 @@ function enrichAsset(asset, priceMap, fxMap, forcedMode = null, syntheticOverrid
     provider_symbol: providerSymbol,
     data_provider: provider,
     coin_id: asset.coin_id,
+
+    // Allocation metadata from Excel / assets table.
+    asset_group: asset.asset_group || null,
+    asset_subgroup: asset.asset_subgroup || null,
+    asset_class: asset.asset_class || null,
+    sector_block: asset.sector_block || null,
+    region: asset.region || null,
+    abcd_rating: asset.abcd_rating || null,
     quantity,
     manual_value: asset.manual_value === null ? null : toNumberOrNull(asset.manual_value),
     target_value: asset.target_value === null ? null : toNumberOrNull(asset.target_value),
@@ -447,6 +455,14 @@ async function buildPortfolioResponse(userIdInput = 1) {
         "needed_quantity",
         "target_value",
         "target_completion_percent"
+      ],
+      allocation_metadata_fields: [
+        "asset_group",
+        "asset_subgroup",
+        "asset_class",
+        "sector_block",
+        "region",
+        "abcd_rating"
       ]
     }
   };
