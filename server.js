@@ -7,6 +7,7 @@ app.use(cors({ origin: true, credentials: false }));
 app.use(express.json({ limit: "2mb" }));
 
 const authRoutes = require("./routes/auth");
+const adminRoutes = require("./routes/admin");
 const mePortfolioRoutes = require("./routes/me-portfolio");
 const meRefreshPricesRoutes = require("./routes/me-refresh-prices");
 const mePortfolioSnapshotsRoutes = require("./routes/me-portfolio-snapshots");
@@ -37,6 +38,7 @@ function requireDashboardToken(req, res, next) {
 
 // Authenticated user-facing routes. These should be used by fvoelkel.com/portfolio-dashboard.
 app.use("/api/auth", authRoutes);
+app.use("/api/admin", adminRoutes);
 app.use("/api/me/portfolio", mePortfolioRoutes);
 app.use("/api/me/refresh-prices", meRefreshPricesRoutes);
 app.use("/api/me/portfolio-snapshots", mePortfolioSnapshotsRoutes);
@@ -51,7 +53,7 @@ app.use("/api/portfolio-snapshots", portfolioSnapshotsRoutes);
 app.use("/api/assets/search", assetSymbolSearchRoutes);
 
 app.get("/", (req, res) => {
-  res.json({ status: "wealth-os online", version: "v3.2.1-alternative-assets-ux-schema" });
+  res.json({ status: "wealth-os online", version: "v3.3-admin-login-multi-user" });
 });
 
 const PORT = process.env.PORT || 3000;
