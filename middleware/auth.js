@@ -57,6 +57,16 @@ async function requireAuth(req, res, next) {
   }
 }
 
+async function requireAdmin(req, res, next) {
+  return requireAuth(req, res, () => {
+    const role = String(req.authUser?.role || "").toLowerCase();
+    if (role !== "admin") {
+      return res.status(403).json({ error: "Admin-Zugriff erforderlich." });
+    }
+    next();
+  });
+}
+
 function signUserToken(user) {
   return jwt.sign(
     {
@@ -74,5 +84,6 @@ function signUserToken(user) {
 
 module.exports = {
   requireAuth,
+  requireAdmin,
   signUserToken
 };
