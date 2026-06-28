@@ -2,13 +2,13 @@ const router = require("express").Router();
 const db = require("../db");
 const { requireAuth } = require("../middleware/auth");
 
-const ME_ASSETS_VERSION = "me-assets-v3.2-alternative-assets";
+const ME_ASSETS_VERSION = "me-assets-v3.2.1-alternative-assets-safe-errors";
 
 function optionalNumber(value, fallback = null) {
   if (value === undefined) return fallback;
   if (value === null || value === "") return null;
   const n = Number(value);
-  if (!Number.isFinite(n)) throw new Error(`Invalid numeric value: ${value}`);
+  if (!Number.isFinite(n)) throw new Error("Bitte gib eine gültige Zahl ein.");
   return n;
 }
 
@@ -26,7 +26,7 @@ function optionalBoolean(value, fallback = false) {
   const normalized = String(value).toLowerCase().trim();
   if (["true", "1", "yes", "ja"].includes(normalized)) return true;
   if (["false", "0", "no", "nein"].includes(normalized)) return false;
-  throw new Error(`Invalid boolean value: ${value}`);
+  throw new Error("Bitte wähle Ja oder Nein.");
 }
 
 function optionalJson(value, fallback = {}) {
@@ -39,12 +39,12 @@ function optionalJson(value, fallback = {}) {
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
     } catch (_) {}
   }
-  throw new Error("asset_details must be a JSON object");
+  throw new Error("Die Zusatzdaten konnten nicht verarbeitet werden.");
 }
 
 function normalizeEnum(value, allowed, fallback, fieldName) {
   const normalized = optionalText(value, fallback);
-  if (!allowed.includes(normalized)) throw new Error(`${fieldName} must be one of: ${allowed.join(", ")}`);
+  if (!allowed.includes(normalized)) throw new Error("Bitte wähle einen gültigen Wert aus.");
   return normalized;
 }
 
@@ -52,19 +52,85 @@ function parseProvider(value) {
   const parsed = optionalText(value);
   if (parsed === undefined || parsed === null || parsed === "manual") return null;
   if (!["finnhub", "coingecko", "twelvedata"].includes(parsed)) {
-    throw new Error("data_provider must be finnhub, coingecko, twelvedata or empty/manual");
+    throw new Error("Bitte wähle eine gültige Datenquelle aus.");
   }
   return parsed;
 }
 
+
+
+function validateNonNegativeNumbers(obj, path = "") {
+  if (!obj || typeof obj !== "object") return;
+  for (const [key, value] of Object.entries(obj)) {
+    const label = path ? `${path}.${key}` : key;
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      validateNonNegativeNumbers(value, label);
+      continue;
+    }
+    if (value === null || value === undefined || value === "") continue;
+    const numericKeys = [
+      "quantity", "manual_value", "target_value", "purchase_price", "current_estimated_value", "current_value",
+      "market_value", "current_property_value", "equity_paid", "remaining_debt", "financing_rate_percent",
+      "repayment_months", "monthly_payment", "annual_value_growth_percent", "projected_annual_growth_percent",
+      "projection_years", "holding_years", "monthly_rent_income", "monthly_operating_costs", "selling_cost_percent"
+    ];
+    if (!numericKeys.includes(key)) continue;
+    const n = Number(value);
+    if (!Number.isFinite(n) || n < 0) throw new Error("Beträge, Stückzahlen und Prozentwerte dürfen nicht negativ sein.");
+  }
+}
+
+function normalizeAlternativePayload(body) {
+  const requestedType = optionalText(body.type, "stock");
+  const assetDetails = optionalJson(body.asset_details, {});
+  const kindFromDetails = assetDetails.kind || assetDetails.asset_kind;
+  const kind = ["vehicle", "real_estate"].includes(requestedType)
+    ? requestedType
+    : (["vehicle", "real_estate"].includes(kindFromDetails) ? kindFromDetails : null);
+
+  if (!kind) {
+    return { dbType: requestedType, assetDetails };
+  }
+
+  assetDetails.kind = kind;
+  return { dbType: "manual", assetDetails };
+}
+
+function safeAssetError(res, err, fallbackMessage) {
+  console.error(err);
+
+  const userMessages = [
+    "Bitte gib eine gültige Zahl ein.",
+    "Bitte wähle Ja oder Nein.",
+    "Bitte wähle einen gültigen Wert aus.",
+    "Bitte wähle eine gültige Datenquelle aus.",
+    "Für Finnhub-Werte ist ein Ticker erforderlich.",
+    "Für CoinGecko-Werte ist eine Coin ID erforderlich.",
+    "Die Zusatzdaten konnten nicht verarbeitet werden.",
+    "Beträge, Stückzahlen und Prozentwerte dürfen nicht negativ sein."
+  ];
+
+  if (userMessages.includes(err.message)) {
+    return res.status(400).json({ error: err.message });
+  }
+
+  return res.status(400).json({
+    error: fallbackMessage,
+    code: "ASSET_SAVE_FAILED"
+  });
+}
+
 router.post("/", requireAuth, async (req, res) => {
   try {
+    validateNonNegativeNumbers(req.body);
+
     const userId = req.authUser.id;
     const name = optionalText(req.body.name);
-    if (!name) return res.status(400).json({ error: "name is required" });
+    if (!name) return res.status(400).json({ error: "Bitte gib einen Namen ein." });
 
     const mode = normalizeEnum(req.body.mode, ["portfolio", "watchlist"], "watchlist", "mode");
-    const type = normalizeEnum(req.body.type, ["stock", "etf", "crypto", "manual", "vehicle", "real_estate"], "stock", "type");
+    const alternative = normalizeAlternativePayload(req.body);
+    const type = normalizeEnum(alternative.dbType, ["stock", "etf", "crypto", "manual"], "stock", "type");
 
     let dataProvider = parseProvider(req.body.data_provider);
     let symbol = optionalText(req.body.symbol);
@@ -72,7 +138,7 @@ router.post("/", requireAuth, async (req, res) => {
     let coinId = optionalText(req.body.coin_id);
     let liveEnabled = optionalBoolean(req.body.live_enabled, Boolean(dataProvider));
 
-    if (type === "manual" || type === "vehicle" || type === "real_estate") {
+    if (type === "manual") {
       dataProvider = null;
       providerSymbol = null;
       coinId = null;
@@ -82,14 +148,14 @@ router.post("/", requireAuth, async (req, res) => {
     if (!dataProvider) liveEnabled = false;
 
     if (dataProvider === "finnhub") {
-      if (!symbol && !providerSymbol) throw new Error("symbol or provider_symbol is required for Finnhub assets");
+      if (!symbol && !providerSymbol) throw new Error("Für Finnhub-Werte ist ein Ticker erforderlich.");
       if (!symbol) symbol = providerSymbol;
       if (!providerSymbol) providerSymbol = symbol;
       coinId = null;
     }
 
     if (dataProvider === "coingecko") {
-      if (!coinId && !providerSymbol) throw new Error("coin_id or provider_symbol is required for CoinGecko assets");
+      if (!coinId && !providerSymbol) throw new Error("Für CoinGecko-Werte ist eine Coin ID erforderlich.");
       if (!coinId) coinId = providerSymbol;
       if (!providerSymbol) providerSymbol = coinId;
       if (!symbol) symbol = providerSymbol;
@@ -126,26 +192,31 @@ router.post("/", requireAuth, async (req, res) => {
         optionalText(req.body.sector_block),
         optionalText(req.body.region),
         optionalText(req.body.abcd_rating),
-        JSON.stringify(optionalJson(req.body.asset_details, {}))
+        JSON.stringify(alternative.assetDetails || {})
       ]
     );
 
     res.status(201).json({ assets_version: ME_ASSETS_VERSION, ok: true, asset: result.rows[0] });
   } catch (err) {
-    console.error(err);
-    res.status(400).json({ error: "Asset create failed", details: err.message });
+    return safeAssetError(res, err, "Der Wert konnte nicht gespeichert werden. Bitte prüfe die Eingaben.");
   }
 });
 
 router.post("/:id", requireAuth, async (req, res) => {
   try {
+    validateNonNegativeNumbers(req.body);
+
     const id = Number(req.params.id);
-    if (!Number.isInteger(id)) return res.status(400).json({ error: "asset id is required" });
+    if (!Number.isInteger(id)) return res.status(400).json({ error: "Ungültige Asset-ID." });
 
     const allowed = {
       name: optionalText,
       mode: (v) => normalizeEnum(v, ["portfolio", "watchlist"], "watchlist", "mode"),
-      type: (v) => normalizeEnum(v, ["stock", "etf", "crypto", "manual", "vehicle", "real_estate"], "stock", "type"),
+      type: (v) => {
+        const alternative = normalizeAlternativePayload({ ...req.body, type: v });
+        req.__normalizedAssetDetails = alternative.assetDetails;
+        return normalizeEnum(alternative.dbType, ["stock", "etf", "crypto", "manual"], "stock", "type");
+      },
       quantity: (v) => optionalNumber(v, null),
       manual_value: (v) => optionalNumber(v, null),
       target_value: (v) => optionalNumber(v, null),
@@ -165,7 +236,7 @@ router.post("/:id", requireAuth, async (req, res) => {
       sector_block: optionalText,
       region: optionalText,
       abcd_rating: optionalText,
-      asset_details: (v) => JSON.stringify(optionalJson(v, {}))
+      asset_details: (v) => JSON.stringify(req.__normalizedAssetDetails || normalizeAlternativePayload(req.body).assetDetails || optionalJson(v, {}))
     };
 
     const fields = [];
@@ -178,7 +249,12 @@ router.post("/:id", requireAuth, async (req, res) => {
       }
     }
 
-    if (!fields.length) return res.status(400).json({ error: "No update fields provided" });
+    if (req.__normalizedAssetDetails && req.body.asset_details === undefined) {
+      values.push(JSON.stringify(req.__normalizedAssetDetails));
+      fields.push(`asset_details = $${values.length}`);
+    }
+
+    if (!fields.length) return res.status(400).json({ error: "Es wurden keine Änderungen übermittelt." });
 
     values.push(req.authUser.id);
     values.push(id);
@@ -194,11 +270,10 @@ router.post("/:id", requireAuth, async (req, res) => {
       values
     );
 
-    if (!result.rows.length) return res.status(404).json({ error: "Asset not found" });
+    if (!result.rows.length) return res.status(404).json({ error: "Der Wert wurde nicht gefunden." });
     res.json({ assets_version: ME_ASSETS_VERSION, ok: true, asset: result.rows[0] });
   } catch (err) {
-    console.error(err);
-    res.status(400).json({ error: "Asset update failed", details: err.message });
+    return safeAssetError(res, err, "Der Wert konnte nicht aktualisiert werden. Bitte prüfe die Eingaben.");
   }
 });
 
