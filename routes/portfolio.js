@@ -1,7 +1,7 @@
 const router = require("express").Router();
 const db = require("../db");
 
-const ENGINE_VERSION = "price-engine-v3.2-alternative-assets-irr";
+const ENGINE_VERSION = "price-engine-v3.2.1-alternative-assets-ux-schema";
 
 function toNumberOrNull(value) {
   if (value === null || value === undefined || value === "") return null;
@@ -33,6 +33,16 @@ function parseAssetDetails(value) {
     }
   }
   return {};
+}
+
+function getAlternativeAssetKind(asset) {
+  const assetDetails = parseAssetDetails(asset.asset_details);
+  const explicitKind = assetDetails.kind || assetDetails.asset_kind;
+  if (explicitKind === "vehicle" || explicitKind === "real_estate") return explicitKind;
+  if (assetDetails.vehicle) return "vehicle";
+  if (assetDetails.real_estate) return "real_estate";
+  if (asset.type === "vehicle" || asset.type === "real_estate") return asset.type;
+  return null;
 }
 
 function numberFromDetails(details, keys, fallback = null) {
@@ -257,8 +267,9 @@ function buildRealEstateMetrics(asset) {
 }
 
 function calculateAlternativeAssetSnapshot(asset) {
-  if (asset.type === "vehicle") return buildVehicleMetrics(asset);
-  if (asset.type === "real_estate") return buildRealEstateMetrics(asset);
+  const kind = getAlternativeAssetKind(asset);
+  if (kind === "vehicle") return buildVehicleMetrics(asset);
+  if (kind === "real_estate") return buildRealEstateMetrics(asset);
   return null;
 }
 
@@ -713,6 +724,7 @@ async function buildPortfolioResponse(userIdInput = 1) {
         "abcd_rating"
       ],
       alternative_asset_types: ["vehicle", "real_estate"],
+      alternative_asset_storage: "type=manual + asset_details.kind",
       real_estate_calculation_fields: [
         "current_property_value",
         "equity_paid",
