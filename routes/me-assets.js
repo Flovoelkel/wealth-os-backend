@@ -2,7 +2,7 @@ const router = require("express").Router();
 const db = require("../db");
 const { requireAuth } = require("../middleware/auth");
 
-const ME_ASSETS_VERSION = "me-assets-v3.0";
+const ME_ASSETS_VERSION = "me-assets-v3.2-alternative-assets";
 
 function optionalNumber(value, fallback = null) {
   if (value === undefined) return fallback;
@@ -29,6 +29,19 @@ function optionalBoolean(value, fallback = false) {
   throw new Error(`Invalid boolean value: ${value}`);
 }
 
+function optionalJson(value, fallback = {}) {
+  if (value === undefined) return fallback;
+  if (value === null || value === "") return {};
+  if (typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value === "string") {
+    try {
+      const parsed = JSON.parse(value);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+    } catch (_) {}
+  }
+  throw new Error("asset_details must be a JSON object");
+}
+
 function normalizeEnum(value, allowed, fallback, fieldName) {
   const normalized = optionalText(value, fallback);
   if (!allowed.includes(normalized)) throw new Error(`${fieldName} must be one of: ${allowed.join(", ")}`);
@@ -51,7 +64,7 @@ router.post("/", requireAuth, async (req, res) => {
     if (!name) return res.status(400).json({ error: "name is required" });
 
     const mode = normalizeEnum(req.body.mode, ["portfolio", "watchlist"], "watchlist", "mode");
-    const type = normalizeEnum(req.body.type, ["stock", "etf", "crypto", "manual"], "stock", "type");
+    const type = normalizeEnum(req.body.type, ["stock", "etf", "crypto", "manual", "vehicle", "real_estate"], "stock", "type");
 
     let dataProvider = parseProvider(req.body.data_provider);
     let symbol = optionalText(req.body.symbol);
@@ -59,7 +72,7 @@ router.post("/", requireAuth, async (req, res) => {
     let coinId = optionalText(req.body.coin_id);
     let liveEnabled = optionalBoolean(req.body.live_enabled, Boolean(dataProvider));
 
-    if (type === "manual") {
+    if (type === "manual" || type === "vehicle" || type === "real_estate") {
       dataProvider = null;
       providerSymbol = null;
       coinId = null;
@@ -87,9 +100,9 @@ router.post("/", requireAuth, async (req, res) => {
       INSERT INTO assets (
         user_id, mode, name, type, symbol, provider_symbol, data_provider, coin_id,
         quantity, manual_value, target_value, price_currency, live_enabled, notes_internal,
-        asset_group, asset_subgroup, asset_class, sector_block, region, abcd_rating
+        asset_group, asset_subgroup, asset_class, sector_block, region, abcd_rating, asset_details
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
       RETURNING *
       `,
       [
@@ -112,7 +125,8 @@ router.post("/", requireAuth, async (req, res) => {
         optionalText(req.body.asset_class),
         optionalText(req.body.sector_block),
         optionalText(req.body.region),
-        optionalText(req.body.abcd_rating)
+        optionalText(req.body.abcd_rating),
+        JSON.stringify(optionalJson(req.body.asset_details, {}))
       ]
     );
 
@@ -131,7 +145,7 @@ router.post("/:id", requireAuth, async (req, res) => {
     const allowed = {
       name: optionalText,
       mode: (v) => normalizeEnum(v, ["portfolio", "watchlist"], "watchlist", "mode"),
-      type: (v) => normalizeEnum(v, ["stock", "etf", "crypto", "manual"], "stock", "type"),
+      type: (v) => normalizeEnum(v, ["stock", "etf", "crypto", "manual", "vehicle", "real_estate"], "stock", "type"),
       quantity: (v) => optionalNumber(v, null),
       manual_value: (v) => optionalNumber(v, null),
       target_value: (v) => optionalNumber(v, null),
@@ -150,7 +164,8 @@ router.post("/:id", requireAuth, async (req, res) => {
       asset_class: optionalText,
       sector_block: optionalText,
       region: optionalText,
-      abcd_rating: optionalText
+      abcd_rating: optionalText,
+      asset_details: (v) => JSON.stringify(optionalJson(v, {}))
     };
 
     const fields = [];
