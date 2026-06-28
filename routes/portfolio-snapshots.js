@@ -2,7 +2,7 @@ const router = require("express").Router();
 const db = require("../db");
 const portfolioRoutes = require("./portfolio");
 
-const SNAPSHOT_VERSION = "portfolio-snapshots-v1.8";
+const SNAPSHOT_VERSION = "portfolio-snapshots-v3.0-multi-user";
 
 function todayIsoDate() {
   return new Date().toISOString().slice(0, 10);
@@ -29,7 +29,7 @@ function toNumber(value, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
-router.get("/", requirePublicToken, async (req, res) => {
+async function handleGetSnapshots(req, res) {
   try {
     const userId = Number(req.query.user_id || 1);
     const limit = Math.min(Math.max(Number(req.query.limit || 365), 1), 2000);
@@ -69,76 +69,126 @@ router.get("/", requirePublicToken, async (req, res) => {
     console.error(err);
     res.status(500).json({ error: "Snapshot history failed", details: err.message });
   }
-});
+}
 
-router.post("/capture", requireAdminToken, async (req, res) => {
+async function captureSnapshotForUser(userId, snapshotDate = todayIsoDate()) {
+  const portfolio = await portfolioRoutes.buildPortfolioResponse(userId);
+  const assetCount =
+    (portfolio.portfolio?.assets?.length || 0) +
+    (portfolio.watchlist?.assets?.filter((asset) => !asset.is_synthetic).length || 0);
+
+  const result = await db.query(
+    `
+    INSERT INTO portfolio_snapshots (
+      user_id,
+      snapshot_date,
+      currency,
+      total_value,
+      total_day_change_value,
+      total_day_change_percent,
+      portfolio_value,
+      watchlist_value,
+      target_gap_value,
+      target_gap_count,
+      asset_count,
+      payload,
+      updated_at
+    )
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
+    ON CONFLICT (user_id, snapshot_date)
+    DO UPDATE SET
+      currency = EXCLUDED.currency,
+      total_value = EXCLUDED.total_value,
+      total_day_change_value = EXCLUDED.total_day_change_value,
+      total_day_change_percent = EXCLUDED.total_day_change_percent,
+      portfolio_value = EXCLUDED.portfolio_value,
+      watchlist_value = EXCLUDED.watchlist_value,
+      target_gap_value = EXCLUDED.target_gap_value,
+      target_gap_count = EXCLUDED.target_gap_count,
+      asset_count = EXCLUDED.asset_count,
+      payload = EXCLUDED.payload,
+      updated_at = NOW()
+    RETURNING *
+    `,
+    [
+      userId,
+      snapshotDate,
+      portfolio.currency || "EUR",
+      toNumber(portfolio.total_value),
+      toNumber(portfolio.total_day_change_value),
+      portfolio.total_day_change_percent,
+      toNumber(portfolio.portfolio?.total_value),
+      toNumber(portfolio.watchlist?.total_value),
+      toNumber(portfolio.target_gaps?.total_value),
+      Number(portfolio.target_gaps?.count || 0),
+      assetCount,
+      portfolio
+    ]
+  );
+
+  return result.rows[0];
+}
+
+async function handleCaptureSnapshot(req, res) {
   try {
     const userId = Number(req.body?.user_id || req.query.user_id || 1);
     const snapshotDate = req.body?.snapshot_date || req.query.snapshot_date || todayIsoDate();
-
-    const portfolio = await portfolioRoutes.buildPortfolioResponse(userId);
-    const assetCount =
-      (portfolio.portfolio?.assets?.length || 0) +
-      (portfolio.watchlist?.assets?.filter((asset) => !asset.is_synthetic).length || 0);
-
-    const result = await db.query(
-      `
-      INSERT INTO portfolio_snapshots (
-        user_id,
-        snapshot_date,
-        currency,
-        total_value,
-        total_day_change_value,
-        total_day_change_percent,
-        portfolio_value,
-        watchlist_value,
-        target_gap_value,
-        target_gap_count,
-        asset_count,
-        payload,
-        updated_at
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NOW())
-      ON CONFLICT (user_id, snapshot_date)
-      DO UPDATE SET
-        currency = EXCLUDED.currency,
-        total_value = EXCLUDED.total_value,
-        total_day_change_value = EXCLUDED.total_day_change_value,
-        total_day_change_percent = EXCLUDED.total_day_change_percent,
-        portfolio_value = EXCLUDED.portfolio_value,
-        watchlist_value = EXCLUDED.watchlist_value,
-        target_gap_value = EXCLUDED.target_gap_value,
-        target_gap_count = EXCLUDED.target_gap_count,
-        asset_count = EXCLUDED.asset_count,
-        payload = EXCLUDED.payload,
-        updated_at = NOW()
-      RETURNING *
-      `,
-      [
-        userId,
-        snapshotDate,
-        portfolio.currency || "EUR",
-        toNumber(portfolio.total_value),
-        toNumber(portfolio.total_day_change_value),
-        portfolio.total_day_change_percent,
-        toNumber(portfolio.portfolio?.total_value),
-        toNumber(portfolio.watchlist?.total_value),
-        toNumber(portfolio.target_gaps?.total_value),
-        Number(portfolio.target_gaps?.count || 0),
-        assetCount,
-        portfolio
-      ]
-    );
+    const snapshot = await captureSnapshotForUser(userId, snapshotDate);
 
     res.status(201).json({
       snapshot_version: SNAPSHOT_VERSION,
       ok: true,
-      snapshot: result.rows[0]
+      snapshot
     });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Snapshot capture failed", details: err.message });
   }
-});
+}
+
+async function handleCaptureAll(req, res) {
+  try {
+    const snapshotDate = req.body?.snapshot_date || req.query.snapshot_date || todayIsoDate();
+
+    const users = await db.query(
+      `
+      SELECT id, email
+      FROM portfolio_users
+      WHERE COALESCE(is_active, true) = true
+      ORDER BY id ASC
+      `
+    );
+
+    const results = [];
+
+    for (const user of users.rows) {
+      try {
+        const snapshot = await captureSnapshotForUser(Number(user.id), snapshotDate);
+        results.push({ user_id: Number(user.id), email: user.email, ok: true, total_value: snapshot.total_value });
+      } catch (err) {
+        results.push({ user_id: Number(user.id), email: user.email, ok: false, error: err.message });
+      }
+    }
+
+    res.status(201).json({
+      snapshot_version: SNAPSHOT_VERSION,
+      ok: results.every((item) => item.ok),
+      snapshot_date: snapshotDate,
+      processed: results.length,
+      results
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Snapshot capture all failed", details: err.message });
+  }
+}
+
+router.get("/", requirePublicToken, handleGetSnapshots);
+router.post("/capture", requireAdminToken, handleCaptureSnapshot);
+router.post("/capture-all", requireAdminToken, handleCaptureAll);
 
 module.exports = router;
+module.exports.handleGetSnapshots = handleGetSnapshots;
+module.exports.handleCaptureSnapshot = handleCaptureSnapshot;
+module.exports.handleCaptureAll = handleCaptureAll;
+module.exports.captureSnapshotForUser = captureSnapshotForUser;
