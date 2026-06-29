@@ -17,6 +17,95 @@ function boolOrNull(value) {
   return value === true || value === "true" || value === 1 || value === "1";
 }
 
+function publicSettingsPayload(settings) {
+  return {
+    public_enabled: settings.public_enabled === true,
+    allow_messages: settings.allow_messages === true,
+    show_exact_values: settings.show_exact_values === true,
+    display_name_mode: settings.display_name_mode || "alias",
+    asset_visibility_mode: settings.asset_visibility_mode || "categories",
+    hidden_asset_ids: parseJsonArray(settings.hidden_asset_ids),
+    interests: parseJsonArray(settings.interests)
+  };
+}
+
+function canMessageRow(row) {
+  return Boolean(row && (row.message_opt_in === true || row.allow_messages === true) && row.my_league_key && row.league_key && row.my_league_key === row.league_key);
+}
+
+router.get("/me/settings", requireAuth, async (req, res) => {
+  try {
+    const state = await buildGameStateForUser(req.authUser);
+    const settings = await ensurePublicSettings(req.authUser.id);
+    const assets = await db.query(
+      `SELECT id, name, public_visibility, asset_game_class, is_liquid FROM assets WHERE user_id = $1 ORDER BY name ASC`,
+      [req.authUser.id]
+    );
+    res.json({
+      ok: true,
+      community_version: GAME_VERSION,
+      profile: state.profile,
+      public_settings: publicSettingsPayload(settings),
+      assets: assets.rows
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, error: "Community-Einstellungen konnten nicht geladen werden." });
+  }
+});
+
+router.get("/feed", requireAuth, async (req, res) => {
+  try {
+    const state = await buildGameStateForUser(req.authUser);
+    const q = cleanText(req.query.q, "", 100).toLowerCase();
+    const sort = cleanText(req.query.sort, "wealth", 40);
+    const limit = Math.max(1, Math.min(80, Number(req.query.limit || 30)));
+    const params = [req.authUser.id, state.profile.league_key || state.scores.league.key, limit, state.scores.market_wealth || 0];
+    let where = "WHERE u.is_active IS DISTINCT FROM false AND gp.public_profile_enabled = true AND gp.user_id <> $1";
+
+    if (q) {
+      params.push(`%${q}%`);
+      where += ` AND (lower(COALESCE(gp.alias,'')) LIKE $${params.length} OR lower(COALESCE(u.display_name,'')) LIKE $${params.length})`;
+    }
+
+    const order = sort === "league"
+      ? "same_league DESC, COALESCE(gp.market_wealth,0) DESC"
+      : sort === "wins"
+        ? "COALESCE(gp.wins,0) DESC, COALESCE(gp.market_wealth,0) DESC"
+        : sort === "similar"
+          ? "ABS(COALESCE(gp.market_wealth,0) - $4) ASC"
+          : "COALESCE(gp.market_wealth,0) DESC, COALESCE(gp.weighted_wealth,0) DESC";
+
+    const result = await db.query(
+      `
+      SELECT gp.*, u.display_name, pps.allow_messages, pps.asset_visibility_mode,
+             $2::text AS my_league_key,
+             $4::numeric AS my_market_wealth,
+             (gp.league_key = $2::text) AS same_league
+      FROM game_profiles gp
+      JOIN portfolio_users u ON u.id = gp.user_id
+      LEFT JOIN public_portfolio_settings pps ON pps.user_id = gp.user_id
+      ${where}
+      ORDER BY ${order}
+      LIMIT $3
+      `,
+      params
+    );
+
+    const players = result.rows.map((row) => ({
+      ...publicProfileRow(row),
+      same_league: row.same_league === true,
+      can_message: canMessageRow(row),
+      portfolio_visibility_mode: row.asset_visibility_mode || "categories"
+    }));
+
+    res.json({ ok: true, community_version: GAME_VERSION, my_league_key: state.profile.league_key, players });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, error: "Community-Feed konnte nicht geladen werden." });
+  }
+});
+
 router.get("/players", async (req, res) => {
   try {
     const q = cleanText(req.query.q, "", 100).toLowerCase();
