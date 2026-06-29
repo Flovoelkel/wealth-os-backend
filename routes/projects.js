@@ -3,6 +3,9 @@ const db = require("../db");
 const { requireAuth } = require("../middleware/auth");
 const { cleanText, parseJsonArray, parseJsonObject, toNumber, safeError, buildGameStateForUser } = require("./game-helpers");
 
+const MAX_PROJECT_IMAGES = 8;
+const MAX_IMAGE_DATA_URL_LENGTH = 700000;
+
 function positiveAmount(value) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) throw new Error("Bitte einen positiven Betrag verwenden.");
@@ -10,19 +13,64 @@ function positiveAmount(value) {
 }
 
 function normalizeImages(images) {
-  return parseJsonArray(images).slice(0, 8).map((item, index) => {
+  return parseJsonArray(images).slice(0, MAX_PROJECT_IMAGES).map((item, index) => {
     const obj = typeof item === "string" ? { image_url: item } : parseJsonObject(item);
+    const dataUrl = cleanText(obj.image_data_url, null, MAX_IMAGE_DATA_URL_LENGTH);
     return {
       image_url: cleanText(obj.image_url, null, 1200),
-      image_data_url: cleanText(obj.image_data_url, null, 700000),
+      image_data_url: dataUrl && /^data:image\/(png|jpe?g|webp|gif);base64,/i.test(dataUrl) ? dataUrl : null,
       image_alt: cleanText(obj.image_alt, "Projektbild", 180),
       sort_order: Number.isInteger(Number(obj.sort_order)) ? Number(obj.sort_order) : index
     };
   }).filter((item) => item.image_url || item.image_data_url);
 }
 
-async function getLiquidAssets(userId) {
-  const result = await db.query(
+function projectSelectSql(whereSql = "p.visibility = 'public'") {
+  return `
+    SELECT
+      p.*,
+      u.display_name,
+      gp.alias,
+      COALESCE(s.supported_amount,0)::numeric AS supported_amount,
+      COALESCE(s.support_count,0)::int AS support_count,
+      COALESCE(img.images,'[]'::jsonb) AS images
+    FROM crowdfunding_projects p
+    JOIN portfolio_users u ON u.id = p.owner_user_id
+    LEFT JOIN game_profiles gp ON gp.user_id = p.owner_user_id
+    LEFT JOIN (
+      SELECT project_id, COALESCE(SUM(amount),0) AS supported_amount, COUNT(*)::int AS support_count
+      FROM crowdfunding_supports
+      GROUP BY project_id
+    ) s ON s.project_id = p.id
+    LEFT JOIN (
+      SELECT project_id,
+        jsonb_agg(
+          jsonb_build_object(
+            'id', id,
+            'image_url', image_url,
+            'image_data_url', image_data_url,
+            'image_alt', image_alt,
+            'sort_order', sort_order
+          ) ORDER BY sort_order ASC, id ASC
+        ) AS images
+      FROM crowdfunding_project_images
+      GROUP BY project_id
+    ) img ON img.project_id = p.id
+    WHERE ${whereSql}
+  `;
+}
+
+async function liquidAssetsQuery(client, userId, options = {}) {
+  const sourceAssetId = options.sourceAssetId ? Number(options.sourceAssetId) : null;
+  const forUpdate = options.forUpdate ? "FOR UPDATE" : "";
+  const params = [userId];
+  let sourceFilter = "";
+  if (sourceAssetId) {
+    params.push(sourceAssetId);
+    sourceFilter = `AND id = $${params.length}`;
+  }
+
+  const result = await client.query(
     `
     SELECT id, name, manual_value, asset_details, asset_game_class, is_liquid
     FROM assets
@@ -30,6 +78,7 @@ async function getLiquidAssets(userId) {
       AND mode = 'portfolio'
       AND type = 'manual'
       AND COALESCE(manual_value,0) > 0
+      ${sourceFilter}
       AND (
         is_liquid = true
         OR asset_game_class = 'neutral'
@@ -37,12 +86,14 @@ async function getLiquidAssets(userId) {
         OR lower(COALESCE(name,'')) LIKE '%cash%'
         OR lower(COALESCE(name,'')) LIKE '%tagesgeld%'
         OR lower(COALESCE(name,'')) LIKE '%geldbestand%'
+        OR lower(COALESCE(name,'')) LIKE '%konto%'
       )
     ORDER BY manual_value DESC, id ASC
+    ${forUpdate}
     `,
-    [userId]
+    params
   );
-  return result.rows;
+  return result.rows || [];
 }
 
 async function withTransaction(callback) {
@@ -70,20 +121,9 @@ router.get("/", async (req, res) => {
     const status = cleanText(req.query.status, "active", 40);
     const limit = Math.max(1, Math.min(100, Number(req.query.limit || 50)));
     const result = await db.query(
-      `
-      SELECT p.*, u.display_name, gp.alias,
-        COALESCE(SUM(s.amount),0)::numeric AS supported_amount,
-        COUNT(s.id)::int AS support_count
-      FROM crowdfunding_projects p
-      JOIN portfolio_users u ON u.id = p.owner_user_id
-      LEFT JOIN game_profiles gp ON gp.user_id = p.owner_user_id
-      LEFT JOIN crowdfunding_supports s ON s.project_id = p.id
-      WHERE p.visibility = 'public'
-        AND ($2 = 'all' OR p.status = $2)
-      GROUP BY p.id, u.display_name, gp.alias
-      ORDER BY p.created_at DESC
-      LIMIT $1
-      `,
+      `${projectSelectSql("p.visibility = 'public' AND ($2 = 'all' OR p.status = $2)")}
+       ORDER BY p.created_at DESC
+       LIMIT $1`,
       [limit, status]
     );
     res.json({ ok: true, projects: result.rows });
@@ -93,13 +133,51 @@ router.get("/", async (req, res) => {
   }
 });
 
+router.get("/liquidity", requireAuth, async (req, res) => {
+  try {
+    const assets = await liquidAssetsQuery(db, req.authUser.id);
+    const liquidBalance = assets.reduce((sum, asset) => sum + Number(asset.manual_value || 0), 0);
+    res.json({
+      ok: true,
+      liquid_balance: Number(liquidBalance.toFixed(2)),
+      liquid_assets: assets.map((asset) => ({
+        id: asset.id,
+        name: asset.name,
+        value: Number(asset.manual_value || 0),
+        asset_game_class: asset.asset_game_class,
+        is_liquid: asset.is_liquid
+      }))
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, error: "Liquider Geldbestand konnte nicht geladen werden." });
+  }
+});
+
 router.get("/me", requireAuth, async (req, res) => {
   try {
-    const result = await db.query("SELECT * FROM crowdfunding_projects WHERE owner_user_id = $1 ORDER BY created_at DESC", [req.authUser.id]);
-    res.json({ ok: true, projects: result.rows });
+    const result = await db.query(
+      `${projectSelectSql("p.owner_user_id = $1")}
+       ORDER BY p.created_at DESC`,
+      [req.authUser.id]
+    );
+    res.json({ ok: true, projects: result.rows.map((row) => ({ ...row, is_owner: true })) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ ok: false, error: "Eigene Projekte konnten nicht geladen werden." });
+  }
+});
+
+router.get("/:id", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return safeError(res, 400, "Ungültige Projekt-ID.");
+    const result = await db.query(`${projectSelectSql("p.id = $1 AND (p.visibility = 'public' OR p.owner_user_id = $2)")} LIMIT 1`, [id, req.authUser?.id || 0]);
+    if (!result.rows.length) return safeError(res, 404, "Projekt wurde nicht gefunden.");
+    res.json({ ok: true, project: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, error: "Projekt konnte nicht geladen werden." });
   }
 });
 
@@ -117,26 +195,32 @@ router.post("/", requireAuth, async (req, res) => {
     const visibility = cleanText(req.body.visibility, "public", 40) === "private" ? "private" : "public";
     const images = normalizeImages(req.body.images || req.body.project_images);
 
-    const project = await db.query(
-      `
-      INSERT INTO crowdfunding_projects (
-        owner_user_id, title, category, description, long_description, target_amount,
-        product_exists, product_url, status, visibility, image_urls, created_at, updated_at
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9,$10::jsonb,NOW(),NOW())
-      RETURNING *
-      `,
-      [req.authUser.id, title, category, description, longDescription, targetAmount, productExists, productUrl, visibility, JSON.stringify(images)]
-    );
-
-    for (const image of images) {
-      await db.query(
-        `INSERT INTO crowdfunding_project_images (project_id, image_url, image_data_url, image_alt, sort_order, created_at) VALUES ($1,$2,$3,$4,$5,NOW())`,
-        [project.rows[0].id, image.image_url, image.image_data_url, image.image_alt, image.sort_order]
+    const project = await withTransaction(async (client) => {
+      const projectResult = await client.query(
+        `
+        INSERT INTO crowdfunding_projects (
+          owner_user_id, title, category, description, long_description, target_amount,
+          product_exists, product_url, status, visibility, image_urls, created_at, updated_at
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9,$10::jsonb,NOW(),NOW())
+        RETURNING *
+        `,
+        [req.authUser.id, title, category, description, longDescription, targetAmount, productExists, productUrl, visibility, JSON.stringify(images)]
       );
-    }
 
-    res.status(201).json({ ok: true, project: project.rows[0] });
+      const insertedImages = [];
+      for (const image of images) {
+        const imageResult = await client.query(
+          `INSERT INTO crowdfunding_project_images (project_id, image_url, image_data_url, image_alt, sort_order, created_at) VALUES ($1,$2,$3,$4,$5,NOW()) RETURNING *`,
+          [projectResult.rows[0].id, image.image_url, image.image_data_url, image.image_alt, image.sort_order]
+        );
+        insertedImages.push(imageResult.rows[0]);
+      }
+
+      return { ...projectResult.rows[0], images: insertedImages };
+    });
+
+    res.status(201).json({ ok: true, project });
   } catch (err) {
     console.error(err);
     res.status(400).json({ ok: false, error: "Projekt konnte nicht angelegt werden." });
@@ -174,6 +258,13 @@ router.post("/:id", requireAuth, async (req, res) => {
     if (req.body.images !== undefined || req.body.project_images !== undefined) {
       const images = normalizeImages(req.body.images || req.body.project_images);
       add("image_urls", JSON.stringify(images), "::jsonb");
+      await db.query("DELETE FROM crowdfunding_project_images WHERE project_id = $1", [id]);
+      for (const image of images) {
+        await db.query(
+          `INSERT INTO crowdfunding_project_images (project_id, image_url, image_data_url, image_alt, sort_order, created_at) VALUES ($1,$2,$3,$4,$5,NOW())`,
+          [id, image.image_url, image.image_data_url, image.image_alt, image.sort_order]
+        );
+      }
     }
 
     if (!fields.length) return safeError(res, 400, "Keine Änderungen angegeben.");
@@ -205,6 +296,13 @@ router.post("/:id/images", requireAuth, async (req, res) => {
       );
       inserted.push(result.rows[0]);
     }
+
+    const allImages = await db.query(
+      `SELECT jsonb_agg(jsonb_build_object('id', id, 'image_url', image_url, 'image_data_url', image_data_url, 'image_alt', image_alt, 'sort_order', sort_order) ORDER BY sort_order ASC, id ASC) AS images FROM crowdfunding_project_images WHERE project_id = $1`,
+      [id]
+    );
+    await db.query("UPDATE crowdfunding_projects SET image_urls = COALESCE($2::jsonb,'[]'::jsonb), updated_at = NOW() WHERE id = $1", [id, JSON.stringify(allImages.rows[0]?.images || [])]);
+
     res.status(201).json({ ok: true, images: inserted });
   } catch (err) {
     console.error(err);
@@ -217,19 +315,25 @@ router.post("/:id/support", requireAuth, async (req, res) => {
     const projectId = Number(req.params.id);
     if (!Number.isInteger(projectId)) return safeError(res, 400, "Ungültige Projekt-ID.");
     const amount = positiveAmount(req.body.amount);
-
-    const projectResult = await db.query("SELECT * FROM crowdfunding_projects WHERE id = $1 AND status = 'active' LIMIT 1", [projectId]);
-    const project = projectResult.rows[0];
-    if (!project) return safeError(res, 404, "Projekt wurde nicht gefunden oder ist nicht aktiv.");
-    if (Number(project.owner_user_id) === Number(req.authUser.id)) return safeError(res, 400, "Eigene Projekte können nicht unterstützt werden.");
-
-    const liquidAssets = await getLiquidAssets(req.authUser.id);
-    const liquidBalance = liquidAssets.reduce((sum, asset) => sum + Number(asset.manual_value || 0), 0);
-    if (liquidBalance < amount) {
-      return safeError(res, 400, `Nicht genug liquider Geldbestand. Verfügbar: ${Math.floor(liquidBalance)} €.`);
-    }
+    const sourceAssetId = req.body.source_asset_id ? Number(req.body.source_asset_id) : null;
 
     const result = await withTransaction(async (client) => {
+      const projectResult = await client.query("SELECT * FROM crowdfunding_projects WHERE id = $1 AND status = 'active' FOR UPDATE", [projectId]);
+      const project = projectResult.rows[0];
+      if (!project) throw new Error("Projekt wurde nicht gefunden oder ist nicht aktiv.");
+      if (Number(project.owner_user_id) === Number(req.authUser.id)) throw new Error("Eigene Projekte können nicht unterstützt werden.");
+
+      let liquidAssets = await liquidAssetsQuery(client, req.authUser.id, { sourceAssetId, forUpdate: true });
+      if (sourceAssetId && !liquidAssets.length) throw new Error("Das gewählte liquide Asset wurde nicht gefunden oder hat keinen verfügbaren Geldbestand.");
+
+      // If no source was selected, use all eligible liquid assets in descending value order.
+      if (!sourceAssetId) liquidAssets = await liquidAssetsQuery(client, req.authUser.id, { forUpdate: true });
+      const liquidBalance = liquidAssets.reduce((sum, asset) => sum + Number(asset.manual_value || 0), 0);
+
+      if (liquidBalance < amount) {
+        throw new Error(`Nicht genug liquider Geldbestand. Verfügbar: ${Math.floor(liquidBalance)} €.`);
+      }
+
       let remaining = amount;
       const debited = [];
       for (const asset of liquidAssets) {
@@ -237,18 +341,23 @@ router.post("/:id/support", requireAuth, async (req, res) => {
         const current = Number(asset.manual_value || 0);
         const take = Math.min(current, remaining);
         const nextValue = Number((current - take).toFixed(2));
-        await client.query("UPDATE assets SET manual_value = $3 WHERE user_id = $1 AND id = $2", [req.authUser.id, asset.id, nextValue]);
+        const details = parseJsonObject(asset.asset_details);
+        details.last_crowdfunding_debit = { project_id: projectId, amount: take, at: new Date().toISOString() };
+        await client.query(
+          "UPDATE assets SET manual_value = $3, asset_details = $4::jsonb WHERE user_id = $1 AND id = $2",
+          [req.authUser.id, asset.id, nextValue, JSON.stringify(details)]
+        );
         debited.push({ asset_id: asset.id, name: asset.name, amount: take, remaining_value: nextValue });
         remaining = Number((remaining - take).toFixed(2));
       }
 
       const support = await client.query(
         `
-        INSERT INTO crowdfunding_supports (project_id, supporter_user_id, amount, source_asset_id, support_type, created_at)
-        VALUES ($1,$2,$3,$4,'demo_support',NOW())
+        INSERT INTO crowdfunding_supports (project_id, supporter_user_id, amount, source_asset_id, support_type, debited_assets, created_at)
+        VALUES ($1,$2,$3,$4,'demo_support',$5::jsonb,NOW())
         RETURNING *
         `,
-        [projectId, req.authUser.id, amount, debited[0]?.asset_id || null]
+        [projectId, req.authUser.id, amount, debited[0]?.asset_id || null, JSON.stringify(debited)]
       );
 
       await client.query(
@@ -266,15 +375,26 @@ router.post("/:id/support", requireAuth, async (req, res) => {
           req.authUser.id,
           `Crowdfunding: ${project.title}`,
           amount,
-          JSON.stringify({ kind: "crowdfunding_project", game_class: "crowdfunding", project_id: projectId, support_id: support.rows[0].id, original_amount: amount })
+          JSON.stringify({
+            kind: "crowdfunding_project",
+            game_class: "crowdfunding",
+            project_id: projectId,
+            support_id: support.rows[0].id,
+            original_amount: amount,
+            source_asset_ids: debited.map((item) => item.asset_id),
+            project_title: project.title,
+            project_public_id: project.public_id || null
+          })
         ]
       );
 
-      return { support: support.rows[0], asset: asset.rows[0], debited };
+      await client.query("UPDATE crowdfunding_supports SET resulting_asset_id = $2 WHERE id = $1", [support.rows[0].id, asset.rows[0].id]).catch(() => {});
+
+      return { support: support.rows[0], asset: asset.rows[0], debited, project };
     });
 
     const state = await buildGameStateForUser(req.authUser);
-    res.status(201).json({ ok: true, ...result, liquid_balance_before: liquidBalance, game_state: state });
+    res.status(201).json({ ok: true, ...result, game_state: state });
   } catch (err) {
     console.error(err);
     res.status(400).json({ ok: false, error: err.message || "Projekt konnte nicht unterstützt werden." });
