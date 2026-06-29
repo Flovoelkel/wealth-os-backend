@@ -30,8 +30,44 @@ function normalizeEnum(value, allowed, fallback) {
 
 function positiveNumber(value, fallback = 0) {
   const n = toNumber(value, fallback);
-  if (!Number.isFinite(n) || n < 0) throw new Error("Negative oder ungÃžltige Werte sind nicht erlaubt.");
+  if (!Number.isFinite(n) || n < 0) throw new Error("Negative oder ungültige Werte sind nicht erlaubt.");
   return n;
+}
+
+function gameClassDetails(gameClass, rawDetails = {}) {
+  const details = parseJsonObject(rawDetails);
+  const kindByClass = {
+    immo_self: "real_estate",
+    immo_rent: "real_estate",
+    consumer: "manual_asset",
+    collector: "manual_asset",
+    commodity: "manual_asset",
+    business: "business",
+    crowdfunding: "crowdfunding_project",
+    debt: "debt",
+    neutral: "cash",
+    productive: "manual_productive"
+  };
+  return {
+    ...details,
+    kind: details.kind || kindByClass[gameClass] || "manual_asset",
+    game_class: gameClass,
+    liquidity_class: gameClass === "neutral" ? "liquid" : (details.liquidity_class || "illiquid")
+  };
+}
+
+function manualValueFromBody(body) {
+  return positiveNumber(body.value ?? body.manual_value ?? body.current_value ?? 0, 0);
+}
+
+function isNeutralLiquid(gameClass, body) {
+  if (body.is_liquid !== undefined) return body.is_liquid === true;
+  return gameClass === "neutral";
+}
+
+async function userOwnsAsset(userId, assetId) {
+  const result = await db.query("SELECT * FROM assets WHERE id = $1 AND user_id = $2", [Number(assetId), Number(userId)]);
+  return result.rows[0] || null;
 }
 
 router.get("/meta", async (req, res) => {
@@ -91,8 +127,7 @@ router.post("/profile", requireAuth, async (req, res) => {
         UPDATE public_portfolio_settings
         SET public_enabled = COALESCE($2, public_enabled),
             allow_messages = COALESCE($3, allow_messages),
-            interests = COALESCE($4::jsonb, interests),
-            updated_at = NOW()
+            interests = COALESCE($4::jsonb, interests)
         WHERE user_id = $1
         `,
         [
@@ -190,7 +225,121 @@ router.post("/assets", requireAuth, async (req, res) => {
     res.status(201).json({ ok: true, asset: result.rows[0], game_state: state });
   } catch (err) {
     console.error(err);
-    res.status(400).json({ ok: false, error: "Asset konnte nicht gespeichert werden. Bitte Eingaben prÃžfen." });
+    res.status(400).json({ ok: false, error: "Asset konnte nicht gespeichert werden. Bitte Eingaben prüfen." });
+  }
+});
+
+router.post("/assets/:id", requireAuth, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return safeError(res, 400, "Ungültige Asset-ID.");
+    const existing = await userOwnsAsset(req.authUser.id, id);
+    if (!existing) return safeError(res, 404, "Asset wurde nicht gefunden.");
+
+    const name = cleanText(req.body.name, existing.name, 180);
+    const gameClass = normalizeEnum(req.body.asset_game_class || req.body.game_class || existing.asset_game_class, ALLOWED_GAME_CLASSES, "neutral");
+    const value = req.body.value !== undefined || req.body.manual_value !== undefined || req.body.current_value !== undefined
+      ? manualValueFromBody(req.body)
+      : toNumber(existing.manual_value, 0);
+    const mode = normalizeEnum(req.body.mode || existing.mode, ["portfolio", "watchlist"], "portfolio");
+    const targetValue = req.body.target_value === undefined ? existing.target_value : positiveNumber(req.body.target_value, 0);
+    const details = gameClassDetails(gameClass, { ...parseJsonObject(existing.asset_details), ...parseJsonObject(req.body.asset_details) });
+    const isLiquid = isNeutralLiquid(gameClass, req.body);
+    const publicVisibility = normalizeEnum(req.body.public_visibility || existing.public_visibility || "private", ["private", "public", "category", "categories"], "private");
+
+    const result = await db.query(
+      `
+      UPDATE assets
+      SET name = $3,
+          mode = $4,
+          manual_value = $5,
+          target_value = $6,
+          asset_game_class = $7,
+          public_visibility = $8,
+          is_liquid = $9,
+          asset_details = $10::jsonb
+      WHERE id = $1 AND user_id = $2
+      RETURNING *
+      `,
+      [id, req.authUser.id, name, mode, value, targetValue, gameClass, publicVisibility === "categories" ? "category" : publicVisibility, isLiquid, JSON.stringify(details)]
+    );
+
+    const state = await buildGameStateForUser(req.authUser);
+    res.json({ ok: true, asset: result.rows[0], game_state: state });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ ok: false, error: "Asset konnte nicht aktualisiert werden. Bitte Eingaben prüfen." });
+  }
+});
+
+router.post("/assets/:id/increment", requireAuth, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return safeError(res, 400, "Ungültige Asset-ID.");
+    const amount = positiveNumber(req.body.amount ?? req.body.value, 0);
+    if (amount <= 0) return safeError(res, 400, "Betrag muss größer als 0 sein.");
+
+    const existing = await userOwnsAsset(req.authUser.id, id);
+    if (!existing) return safeError(res, 404, "Asset wurde nicht gefunden.");
+
+    const currentState = await buildGameStateForUser(req.authUser);
+    const scored = (currentState.scores?.assets || []).find((item) => Number(item.id) === id);
+    const currentRealValue = Math.abs(toNumber(scored?.real_value, toNumber(existing.manual_value, 0)));
+    const currentQuantity = toNumber(existing.quantity, 0);
+
+    let updateSql;
+    let values;
+
+    if (["stock", "etf", "crypto"].includes(existing.type) && currentQuantity > 0 && currentRealValue > 0) {
+      const eurPerUnit = currentRealValue / currentQuantity;
+      const additionalQuantity = eurPerUnit > 0 ? amount / eurPerUnit : 0;
+      updateSql = `
+        UPDATE assets
+        SET quantity = COALESCE(quantity,0) + $3,
+            mode = 'portfolio',
+            asset_game_class = COALESCE(asset_game_class, 'productive')
+        WHERE id = $1 AND user_id = $2
+        RETURNING *
+      `;
+      values = [id, req.authUser.id, additionalQuantity];
+    } else {
+      updateSql = `
+        UPDATE assets
+        SET manual_value = COALESCE(manual_value,0) + $3,
+            quantity = COALESCE(NULLIF(quantity,0), 1),
+            mode = 'portfolio',
+            asset_game_class = COALESCE(asset_game_class, $4),
+            is_liquid = CASE WHEN COALESCE(asset_game_class, $4) = 'neutral' THEN true ELSE COALESCE(is_liquid,false) END
+        WHERE id = $1 AND user_id = $2
+        RETURNING *
+      `;
+      values = [id, req.authUser.id, amount, req.body.asset_game_class || existing.asset_game_class || "neutral"];
+    }
+
+    const result = await db.query(updateSql, values);
+    await db.query(
+      `INSERT INTO game_events (user_id, event_type, title, payload, xp_delta, created_at) VALUES ($1,'asset_increment',$2,$3::jsonb,0,NOW())`,
+      [req.authUser.id, "Asset erhöht: " + (existing.name || id), JSON.stringify({ asset_id: id, amount })]
+    );
+    const state = await buildGameStateForUser(req.authUser);
+    res.json({ ok: true, asset: result.rows[0], game_state: state });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ ok: false, error: "Asset konnte nicht erhöht werden. Bitte Eingaben prüfen." });
+  }
+});
+
+router.delete("/assets/:id", requireAuth, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return safeError(res, 400, "Ungültige Asset-ID.");
+    const result = await db.query("DELETE FROM assets WHERE id = $1 AND user_id = $2 RETURNING id, name", [id, req.authUser.id]);
+    if (!result.rows.length) return safeError(res, 404, "Asset wurde nicht gefunden.");
+    const state = await buildGameStateForUser(req.authUser);
+    res.json({ ok: true, deleted: result.rows[0], game_state: state });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ ok: false, error: "Asset konnte nicht gelöscht werden." });
   }
 });
 
@@ -208,8 +357,7 @@ router.post("/import-local", requireAuth, async (req, res) => {
           level = GREATEST(COALESCE(level,1), $3),
           wins = GREATEST(COALESCE(wins,0), $4),
           streak = GREATEST(COALESCE(streak,0), $5),
-          imported_local_state = $6::jsonb,
-          updated_at = NOW()
+          imported_local_state = $6::jsonb
       WHERE user_id = $1
       `,
       [
