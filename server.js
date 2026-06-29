@@ -4,7 +4,7 @@ const cors = require("cors");
 const app = express();
 
 app.use(cors({ origin: true, credentials: false }));
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "8mb" }));
 
 const authRoutes = require("./routes/auth");
 const adminRoutes = require("./routes/admin");
@@ -63,7 +63,7 @@ app.use("/api/portfolio-snapshots", portfolioSnapshotsRoutes);
 app.use("/api/assets/search", assetSymbolSearchRoutes);
 
 app.get("/", (req, res) => {
-  res.json({ status: "wealth-os online", version: "v3.4.4-community-real-opponents" });
+  res.json({ status: "wealth-os online", version: "v3.4.5-crowdfunding-projects" });
 });
 
 const PORT = process.env.PORT || 3000;
