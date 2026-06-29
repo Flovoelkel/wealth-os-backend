@@ -63,7 +63,7 @@ app.use("/api/portfolio-snapshots", portfolioSnapshotsRoutes);
 app.use("/api/assets/search", assetSymbolSearchRoutes);
 
 app.get("/", (req, res) => {
-  res.json({ status: "wealth-os online", version: "v3.4.3-game-asset-sync" });
+  res.json({ status: "wealth-os online", version: "v3.4.4-community-real-opponents" });
 });
 
 const PORT = process.env.PORT || 3000;
