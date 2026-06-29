@@ -2,7 +2,45 @@ const router = require("express").Router();
 const db = require("../db");
 const { requireAuth } = require("../middleware/auth");
 
-const ME_ASSETS_VERSION = "me-assets-v3.2.1-alternative-assets-safe-errors";
+const ME_ASSETS_VERSION = "me-assets-v3.4.3-game-asset-sync";
+
+
+const ALLOWED_GAME_CLASSES = ["productive", "neutral", "commodity", "collector", "immo_self", "immo_rent", "consumer", "business", "crowdfunding", "debt"];
+const ALLOWED_PUBLIC_VISIBILITY = ["private", "public", "category", "categories"];
+
+function normalizeGameClass(value, type, assetDetails) {
+  const explicit = optionalText(value);
+  if (explicit) {
+    if (!ALLOWED_GAME_CLASSES.includes(explicit)) throw new Error("Bitte wähle eine gültige Vermögensklasse aus.");
+    return explicit;
+  }
+
+  const details = assetDetails || {};
+  const kind = details.kind || details.asset_kind;
+  const realEstate = details.real_estate || {};
+  const vehicle = details.vehicle || {};
+
+  if (["stock", "etf", "crypto"].includes(type)) return "productive";
+  if (kind === "real_estate" || details.real_estate) {
+    const usage = String(realEstate.usage || details.usage || "").toLowerCase();
+    const rent = Number(realEstate.monthly_rent_income || 0);
+    return usage.includes("rent") || usage.includes("vermietet") || rent > 0 ? "immo_rent" : "immo_self";
+  }
+  if (kind === "vehicle" || details.vehicle) {
+    const collector = vehicle.is_collector === true || details.is_collector === true || String(vehicle.category || "").toLowerCase().includes("collector");
+    return collector ? "collector" : "consumer";
+  }
+  if (kind === "business") return "business";
+  if (kind === "crowdfunding_project") return "crowdfunding";
+  if (kind === "debt") return "debt";
+  return "neutral";
+}
+
+function normalizePublicVisibility(value) {
+  const parsed = optionalText(value, "private");
+  if (!ALLOWED_PUBLIC_VISIBILITY.includes(parsed)) throw new Error("Bitte wähle eine gültige Sichtbarkeit aus.");
+  return parsed === "categories" ? "category" : parsed;
+}
 
 function optionalNumber(value, fallback = null) {
   if (value === undefined) return fallback;
@@ -76,7 +114,9 @@ function validateNonNegativeNumbers(obj, path = "") {
     ];
     if (!numericKeys.includes(key)) continue;
     const n = Number(value);
-    if (!Number.isFinite(n) || n < 0) throw new Error("Beträge, Stückzahlen und Prozentwerte dürfen nicht negativ sein.");
+    if (!Number.isFinite(n) || n < 0) throw new Error("Beträge, Stückzahlen und Prozentwerte dürfen nicht negativ sein.",
+    "Bitte wähle eine gültige Vermögensklasse aus.",
+    "Bitte wähle eine gültige Sichtbarkeit aus.");
   }
 }
 
@@ -107,7 +147,9 @@ function safeAssetError(res, err, fallbackMessage) {
     "Für Finnhub-Werte ist ein Ticker erforderlich.",
     "Für CoinGecko-Werte ist eine Coin ID erforderlich.",
     "Die Zusatzdaten konnten nicht verarbeitet werden.",
-    "Beträge, Stückzahlen und Prozentwerte dürfen nicht negativ sein."
+    "Beträge, Stückzahlen und Prozentwerte dürfen nicht negativ sein.",
+    "Bitte wähle eine gültige Vermögensklasse aus.",
+    "Bitte wähle eine gültige Sichtbarkeit aus."
   ];
 
   if (userMessages.includes(err.message)) {
@@ -131,6 +173,10 @@ router.post("/", requireAuth, async (req, res) => {
     const mode = normalizeEnum(req.body.mode, ["portfolio", "watchlist"], "watchlist", "mode");
     const alternative = normalizeAlternativePayload(req.body);
     const type = normalizeEnum(alternative.dbType, ["stock", "etf", "crypto", "manual"], "stock", "type");
+    const gameClass = normalizeGameClass(req.body.asset_game_class || req.body.game_class, type, alternative.assetDetails);
+    const publicVisibility = normalizePublicVisibility(req.body.public_visibility);
+    const isLiquid = optionalBoolean(req.body.is_liquid, gameClass === "neutral");
+    alternative.assetDetails = { ...(alternative.assetDetails || {}), game_class: gameClass };
 
     let dataProvider = parseProvider(req.body.data_provider);
     let symbol = optionalText(req.body.symbol);
@@ -166,9 +212,10 @@ router.post("/", requireAuth, async (req, res) => {
       INSERT INTO assets (
         user_id, mode, name, type, symbol, provider_symbol, data_provider, coin_id,
         quantity, manual_value, target_value, price_currency, live_enabled, notes_internal,
-        asset_group, asset_subgroup, asset_class, sector_block, region, abcd_rating, asset_details
+        asset_group, asset_subgroup, asset_class, sector_block, region, abcd_rating, asset_details,
+        asset_game_class, public_visibility, is_liquid
       )
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
       RETURNING *
       `,
       [
@@ -192,7 +239,10 @@ router.post("/", requireAuth, async (req, res) => {
         optionalText(req.body.sector_block),
         optionalText(req.body.region),
         optionalText(req.body.abcd_rating),
-        JSON.stringify(alternative.assetDetails || {})
+        JSON.stringify(alternative.assetDetails || {}),
+        gameClass,
+        publicVisibility,
+        isLiquid
       ]
     );
 
@@ -236,7 +286,10 @@ router.post("/:id", requireAuth, async (req, res) => {
       sector_block: optionalText,
       region: optionalText,
       abcd_rating: optionalText,
-      asset_details: (v) => JSON.stringify(req.__normalizedAssetDetails || normalizeAlternativePayload(req.body).assetDetails || optionalJson(v, {}))
+      asset_details: (v) => JSON.stringify(req.__normalizedAssetDetails || normalizeAlternativePayload(req.body).assetDetails || optionalJson(v, {})),
+      asset_game_class: (v) => normalizeGameClass(v, req.body.type || "manual", optionalJson(req.body.asset_details, {})),
+      public_visibility: normalizePublicVisibility,
+      is_liquid: (v) => optionalBoolean(v, null)
     };
 
     const fields = [];
