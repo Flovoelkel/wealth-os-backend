@@ -8,6 +8,11 @@ app.use(express.json({ limit: "2mb" }));
 
 const authRoutes = require("./routes/auth");
 const adminRoutes = require("./routes/admin");
+const gameRoutes = require("./routes/game");
+const communityRoutes = require("./routes/community");
+const messagesRoutes = require("./routes/messages");
+const projectsRoutes = require("./routes/projects");
+const cronRoutes = require("./routes/cron");
 const mePortfolioRoutes = require("./routes/me-portfolio");
 const meRefreshPricesRoutes = require("./routes/me-refresh-prices");
 const mePortfolioSnapshotsRoutes = require("./routes/me-portfolio-snapshots");
@@ -39,6 +44,11 @@ function requireDashboardToken(req, res, next) {
 // Authenticated user-facing routes. These should be used by fvoelkel.com/portfolio-dashboard.
 app.use("/api/auth", authRoutes);
 app.use("/api/admin", adminRoutes);
+app.use("/api/game", gameRoutes);
+app.use("/api/community", communityRoutes);
+app.use("/api/messages", messagesRoutes);
+app.use("/api/projects", projectsRoutes);
+app.use("/api/cron", cronRoutes);
 app.use("/api/me/portfolio", mePortfolioRoutes);
 app.use("/api/me/refresh-prices", meRefreshPricesRoutes);
 app.use("/api/me/portfolio-snapshots", mePortfolioSnapshotsRoutes);
@@ -53,7 +63,7 @@ app.use("/api/portfolio-snapshots", portfolioSnapshotsRoutes);
 app.use("/api/assets/search", assetSymbolSearchRoutes);
 
 app.get("/", (req, res) => {
-  res.json({ status: "wealth-os online", version: "v3.3-admin-login-multi-user" });
+  res.json({ status: "wealth-os online", version: "v3.4-game-community-foundation" });
 });
 
 const PORT = process.env.PORT || 3000;
