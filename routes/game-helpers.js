@@ -1,7 +1,7 @@
 const db = require("../db");
 const portfolioRoutes = require("./portfolio");
 
-const GAME_VERSION = "game-community-v3.4-foundation";
+const GAME_VERSION = "game-community-v3.4.4-community-real-opponents";
 
 const GAME_CLASSES = [
   { key: "productive", label: "Produktiv", emoji: "📈", multiplier: 1.5, portfolio_label: "Depot / Aktien / ETFs / Fonds", is_live_price_supported: true, sort_order: 10 },
