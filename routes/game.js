@@ -19,7 +19,7 @@ const {
 } = require("./game-helpers");
 
 const ALLOWED_THEMES = ["classic", "midnight", "sand", "sage", "carbon", "bloom", "racing", "royal", "ocean", "mahogany"];
-const ALLOWED_GAME_MODES = ["npc", "global", "league"];
+const ALLOWED_GAME_MODES = ["npc", "global", "league", "community"];
 const ALLOWED_GAME_CLASSES = GAME_CLASSES.map((item) => item.key);
 
 function normalizeEnum(value, allowed, fallback) {
@@ -63,6 +63,136 @@ function manualValueFromBody(body) {
 function isNeutralLiquid(gameClass, body) {
   if (body.is_liquid !== undefined) return body.is_liquid === true;
   return gameClass === "neutral";
+}
+
+
+function currentSeasonKey(date = new Date()) {
+  const year = date.getUTCFullYear();
+  const start = Date.UTC(year, 0, 1);
+  const day = Math.floor((date.getTime() - start) / 86400000);
+  const season = Math.floor(day / 14) + 1;
+  return `${year}-S${String(season).padStart(2, "0")}`;
+}
+
+async function ensureSeason(seasonKey) {
+  await db.query(
+    `
+    INSERT INTO game_seasons (season_key, starts_at, ends_at, is_active, created_at)
+    VALUES ($1, NOW(), NOW() + INTERVAL '14 days', true, NOW())
+    ON CONFLICT (season_key) DO NOTHING
+    `,
+    [seasonKey]
+  ).catch(() => {});
+}
+
+async function fetchEligibleOpponents(userId, leagueKey, marketWealth, personalGoal, limit, excludeIds = []) {
+  const excluded = [Number(userId), ...excludeIds.map(Number).filter(Number.isFinite)];
+  const target = Math.max(Number(marketWealth || 0), Number(personalGoal || 0), 1);
+  const params = [excluded, leagueKey, Number(marketWealth || 0), target, Math.max(1, Math.min(50, Number(limit || 15)))];
+  const result = await db.query(
+    `
+    SELECT gp.*, u.display_name, pps.allow_messages, pps.asset_visibility_mode,
+           (gp.league_key = $2::text) AS same_league,
+           ABS(COALESCE(gp.market_wealth,0) - $3::numeric) AS distance_to_me,
+           ABS(COALESCE(gp.market_wealth,0) - $4::numeric) AS distance_to_goal
+    FROM game_profiles gp
+    JOIN portfolio_users u ON u.id = gp.user_id
+    LEFT JOIN public_portfolio_settings pps ON pps.user_id = gp.user_id
+    WHERE u.is_active IS DISTINCT FROM false
+      AND gp.public_profile_enabled = true
+      AND gp.user_id <> ALL($1::int[])
+    ORDER BY same_league DESC,
+             CASE WHEN COALESCE(gp.market_wealth,0) >= $3::numeric THEN 0 ELSE 1 END ASC,
+             LEAST(ABS(COALESCE(gp.market_wealth,0) - $3::numeric), ABS(COALESCE(gp.market_wealth,0) - $4::numeric)) ASC,
+             COALESCE(gp.market_wealth,0) ASC,
+             gp.user_id ASC
+    LIMIT $5
+    `,
+    params
+  );
+  return result.rows || [];
+}
+
+async function getSeasonOpponentsForUser(userId, state, options = {}) {
+  const limit = Math.max(1, Math.min(15, Number(options.limit || 15)));
+  const seasonKey = currentSeasonKey();
+  await ensureSeason(seasonKey);
+
+  if (options.refresh === true) {
+    await db.query("DELETE FROM game_rivalries WHERE user_id = $1 AND season_key = $2", [userId, seasonKey]).catch(() => {});
+  }
+
+  const existing = await db.query(
+    `
+    SELECT gr.opponent_user_id, gr.slot_rank, gp.*, u.display_name, pps.allow_messages, pps.asset_visibility_mode,
+           (gp.league_key = $3::text) AS same_league
+    FROM game_rivalries gr
+    JOIN game_profiles gp ON gp.user_id = gr.opponent_user_id
+    JOIN portfolio_users u ON u.id = gp.user_id
+    LEFT JOIN public_portfolio_settings pps ON pps.user_id = gp.user_id
+    WHERE gr.user_id = $1
+      AND gr.season_key = $2
+      AND COALESCE(gr.expires_at, NOW() + INTERVAL '1 minute') > NOW()
+      AND u.is_active IS DISTINCT FROM false
+      AND gp.public_profile_enabled = true
+    ORDER BY gr.slot_rank ASC
+    LIMIT $4
+    `,
+    [userId, seasonKey, state.scores.league.key, limit]
+  ).catch(() => ({ rows: [] }));
+
+  const validRows = existing.rows || [];
+  const missing = limit - validRows.length;
+  let newRows = [];
+  if (missing > 0) {
+    const personalGoal = Number(state.profile?.goal_value || state.profile?.target_wealth || state.profile?.goal || 0);
+    const existingIds = validRows.map((row) => row.opponent_user_id || row.user_id);
+    newRows = await fetchEligibleOpponents(userId, state.scores.league.key, state.scores.market_wealth, personalGoal, missing, existingIds);
+    let slot = validRows.length + 1;
+    for (const row of newRows) {
+      await db.query(
+        `
+        INSERT INTO game_rivalries (season_key, user_id, opponent_user_id, slot_rank, source, created_at, expires_at)
+        VALUES ($1,$2,$3,$4,'season_matchmaking',NOW(),NOW() + INTERVAL '14 days')
+        ON CONFLICT (season_key, user_id, opponent_user_id) DO UPDATE
+        SET slot_rank = EXCLUDED.slot_rank,
+            expires_at = EXCLUDED.expires_at
+        `,
+        [seasonKey, userId, row.user_id, slot]
+      ).catch(() => {});
+      row.slot_rank = slot;
+      slot += 1;
+    }
+  }
+
+  return { season_key: seasonKey, rows: [...validRows, ...newRows].slice(0, limit) };
+}
+
+async function postToBrevo(user, state) {
+  const apiKey = process.env.BREVO_API_KEY || process.env.SENDINBLUE_API_KEY;
+  const listId = process.env.BREVO_WEEKLY_UPDATES_LIST_ID || process.env.BREVO_LIST_ID;
+  if (!apiKey || !listId || typeof fetch !== "function") {
+    return { attempted: false, ok: false, reason: "BREVO_API_KEY oder BREVO_LIST_ID fehlt." };
+  }
+  const attrs = {
+    VORNAME: String(user.display_name || "").split(" ")[0] || user.display_name || "",
+    WL_ANLASS: "Wochenupdates aktiviert",
+    WL_REALES_VERMOEGEN: state.scores.real_wealth,
+    WL_VERMOGEN: state.scores.weighted_wealth,
+    WL_MARKTVERMOEGEN: state.scores.market_wealth,
+    WL_AKTIVER_SPIELWERT: state.scores.market_wealth,
+    WL_LEVEL: state.profile.level || 1,
+    WL_SIEGE: state.profile.wins || 0,
+    WL_ASSET_LIST: (state.scores.assets || []).slice(0, 20).map((a) => `${a.name}: ${a.real_value}`).join(" | "),
+    WL_DASHBOARD_URL: process.env.WEALTHLIST_DASHBOARD_URL || "https://fvoelkel.com/portfolio-dashboard/"
+  };
+  const payload = { email: user.email, attributes: attrs, listIds: [Number(listId)], updateEnabled: true };
+  const response = await fetch("https://api.brevo.com/v3/contacts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "api-key": apiKey },
+    body: JSON.stringify(payload)
+  });
+  return { attempted: true, ok: response.ok, status: response.status, payload };
 }
 
 async function userOwnsAsset(userId, assetId) {
@@ -434,32 +564,106 @@ router.get("/leaderboard", requireAuth, async (req, res) => {
 router.get("/opponents", requireAuth, async (req, res) => {
   try {
     const state = await buildGameStateForUser(req.authUser);
-    const limit = Math.max(1, Math.min(50, Number(req.query.limit || 15)));
-    const leagueKey = req.query.league_key || state.scores.league.key;
+    const limit = Math.max(1, Math.min(15, Number(req.query.limit || 15)));
+    const refresh = req.query.refresh === "true" || req.query.rebuild === "true";
+    const mode = cleanText(req.query.mode, "season", 40);
 
-    const result = await db.query(
-      `
-      SELECT gp.*, u.display_name
-      FROM game_profiles gp
-      JOIN portfolio_users u ON u.id = gp.user_id
-      WHERE u.is_active IS DISTINCT FROM false
-        AND gp.user_id <> $1
-        AND gp.league_key = $2
-      ORDER BY ABS(COALESCE(gp.market_wealth,0) - $3) ASC, COALESCE(gp.market_wealth,0) ASC
-      LIMIT $4
-      `,
-      [req.authUser.id, leagueKey, state.scores.market_wealth, limit]
-    );
+    if (mode === "live") {
+      const rows = await fetchEligibleOpponents(req.authUser.id, state.scores.league.key, state.scores.market_wealth, Number(state.profile?.goal_value || 0), limit);
+      return res.json({
+        ok: true,
+        game_version: GAME_VERSION,
+        mode: "live",
+        league_key: state.scores.league.key,
+        opponents: rows.map(publicProfileRow),
+        fallback_required: rows.length < Math.min(3, limit)
+      });
+    }
 
+    const rivals = await getSeasonOpponentsForUser(req.authUser.id, state, { limit, refresh });
     res.json({
       ok: true,
-      league_key: leagueKey,
-      opponents: result.rows.map(publicProfileRow),
-      fallback_required: result.rows.length < Math.min(3, limit)
+      game_version: GAME_VERSION,
+      mode: "season",
+      season_key: rivals.season_key,
+      league_key: state.scores.league.key,
+      opponents: rivals.rows.map(publicProfileRow),
+      fallback_required: rivals.rows.length < Math.min(3, limit)
     });
   } catch (err) {
     console.error(err);
     res.status(500).json({ ok: false, error: "Gegner konnten nicht geladen werden." });
+  }
+});
+
+
+router.get("/email-updates/status", requireAuth, async (req, res) => {
+  try {
+    const result = await db.query(
+      `SELECT * FROM game_email_preferences WHERE user_id = $1 LIMIT 1`,
+      [req.authUser.id]
+    ).catch(() => ({ rows: [] }));
+    const pref = result.rows[0] || null;
+    res.json({ ok: true, weekly_updates_enabled: pref?.weekly_updates_enabled === true, preference: pref });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, error: "E-Mail-Status konnte nicht geladen werden." });
+  }
+});
+
+router.post("/email-updates/enable", requireAuth, async (req, res) => {
+  try {
+    const state = await buildGameStateForUser(req.authUser);
+    let brevo = { attempted: false, ok: false };
+    try { brevo = await postToBrevo(req.authUser, state); } catch (err) { brevo = { attempted: true, ok: false, error: err.message }; }
+
+    const payload = { brevo, scores: state.scores, enabled_from: "wealthlist_button" };
+    const result = await db.query(
+      `
+      INSERT INTO game_email_preferences (user_id, weekly_updates_enabled, brevo_subscribed_at, last_brevo_payload, created_at, updated_at)
+      VALUES ($1,true,NOW(),$2::jsonb,NOW(),NOW())
+      ON CONFLICT (user_id) DO UPDATE
+      SET weekly_updates_enabled = true,
+          brevo_subscribed_at = NOW(),
+          last_brevo_payload = EXCLUDED.last_brevo_payload,
+          updated_at = NOW()
+      RETURNING *
+      `,
+      [req.authUser.id, JSON.stringify(payload)]
+    );
+    await db.query(
+      `UPDATE game_profiles SET email_updates_enabled = true, email_updates_enabled_at = COALESCE(email_updates_enabled_at, NOW()), brevo_last_submitted_at = CASE WHEN $2 THEN NOW() ELSE brevo_last_submitted_at END, updated_at = NOW() WHERE user_id = $1`,
+      [req.authUser.id, brevo.ok === true]
+    ).catch(() => {});
+    res.json({ ok: true, weekly_updates_enabled: true, brevo, preference: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ ok: false, error: "Wochenupdates konnten nicht aktiviert werden." });
+  }
+});
+
+router.post("/email-updates/disable", requireAuth, async (req, res) => {
+  try {
+    const result = await db.query(
+      `
+      INSERT INTO game_email_preferences (user_id, weekly_updates_enabled, brevo_unsubscribed_at, created_at, updated_at)
+      VALUES ($1,false,NOW(),NOW(),NOW())
+      ON CONFLICT (user_id) DO UPDATE
+      SET weekly_updates_enabled = false,
+          brevo_unsubscribed_at = NOW(),
+          updated_at = NOW()
+      RETURNING *
+      `,
+      [req.authUser.id]
+    );
+    await db.query(
+      `UPDATE game_profiles SET email_updates_enabled = false, email_updates_disabled_at = NOW(), updated_at = NOW() WHERE user_id = $1`,
+      [req.authUser.id]
+    ).catch(() => {});
+    res.json({ ok: true, weekly_updates_enabled: false, preference: result.rows[0] });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ ok: false, error: "Wochenupdates konnten nicht deaktiviert werden." });
   }
 });
 
