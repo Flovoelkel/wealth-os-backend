@@ -1,8 +1,9 @@
 const router = require("express").Router();
 const db = require("../db");
 const { requireAuth } = require("../middleware/auth");
+const { buildGameStateForUser } = require("./game-helpers");
 
-const ME_ASSETS_VERSION = "me-assets-v3.4.3-game-asset-sync";
+const ME_ASSETS_VERSION = "me-assets-v3.4.6-autosave-dashboard-ux";
 
 
 const ALLOWED_GAME_CLASSES = ["productive", "neutral", "commodity", "collector", "immo_self", "immo_rent", "consumer", "business", "crowdfunding", "debt"];
@@ -170,7 +171,7 @@ router.post("/", requireAuth, async (req, res) => {
     const name = optionalText(req.body.name);
     if (!name) return res.status(400).json({ error: "Bitte gib einen Namen ein." });
 
-    const mode = normalizeEnum(req.body.mode, ["portfolio", "watchlist"], "watchlist", "mode");
+    const mode = normalizeEnum(req.body.mode, ["portfolio", "watchlist"], "portfolio", "mode");
     const alternative = normalizeAlternativePayload(req.body);
     const type = normalizeEnum(alternative.dbType, ["stock", "etf", "crypto", "manual"], "stock", "type");
     const gameClass = normalizeGameClass(req.body.asset_game_class || req.body.game_class, type, alternative.assetDetails);
@@ -246,7 +247,8 @@ router.post("/", requireAuth, async (req, res) => {
       ]
     );
 
-    res.status(201).json({ assets_version: ME_ASSETS_VERSION, ok: true, asset: result.rows[0] });
+    const gameState = await buildGameStateForUser(req.authUser).catch(() => null);
+    res.status(201).json({ assets_version: ME_ASSETS_VERSION, ok: true, asset: result.rows[0], game_state: gameState });
   } catch (err) {
     return safeAssetError(res, err, "Der Wert konnte nicht gespeichert werden. Bitte prüfe die Eingaben.");
   }
@@ -261,7 +263,7 @@ router.post("/:id", requireAuth, async (req, res) => {
 
     const allowed = {
       name: optionalText,
-      mode: (v) => normalizeEnum(v, ["portfolio", "watchlist"], "watchlist", "mode"),
+      mode: (v) => normalizeEnum(v, ["portfolio", "watchlist"], "portfolio", "mode"),
       type: (v) => {
         const alternative = normalizeAlternativePayload({ ...req.body, type: v });
         req.__normalizedAssetDetails = alternative.assetDetails;
@@ -288,7 +290,7 @@ router.post("/:id", requireAuth, async (req, res) => {
       abcd_rating: optionalText,
       asset_details: (v) => JSON.stringify(req.__normalizedAssetDetails || normalizeAlternativePayload(req.body).assetDetails || optionalJson(v, {})),
       asset_game_class: (v) => normalizeGameClass(v, req.body.type || "manual", optionalJson(req.body.asset_details, {})),
-      public_visibility: normalizePublicVisibility,
+      public_visibility: normalizePublicVisibility, // kept for API compatibility; Portfolio-Dashboard v3.4.6 no longer exposes this field
       is_liquid: (v) => optionalBoolean(v, null)
     };
 
@@ -324,7 +326,8 @@ router.post("/:id", requireAuth, async (req, res) => {
     );
 
     if (!result.rows.length) return res.status(404).json({ error: "Der Wert wurde nicht gefunden." });
-    res.json({ assets_version: ME_ASSETS_VERSION, ok: true, asset: result.rows[0] });
+    const gameState = await buildGameStateForUser(req.authUser).catch(() => null);
+    res.json({ assets_version: ME_ASSETS_VERSION, ok: true, asset: result.rows[0], game_state: gameState });
   } catch (err) {
     return safeAssetError(res, err, "Der Wert konnte nicht aktualisiert werden. Bitte prüfe die Eingaben.");
   }
