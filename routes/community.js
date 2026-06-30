@@ -254,11 +254,11 @@ router.post("/me/assets/:assetId/visibility", requireAuth, async (req, res) => {
     const assetId = Number(req.params.assetId);
     if (!Number.isInteger(assetId)) return safeError(res, 400, "Ungültige Asset-ID.");
     const visibility = cleanText(req.body.public_visibility, "private", 40);
-    if (!["private", "public", "category_only"].includes(visibility)) return safeError(res, 400, "Sichtbarkeit ist ungültig.");
+    if (!["private", "public", "category", "categories", "category_only"].includes(visibility)) return safeError(res, 400, "Sichtbarkeit ist ungültig.");
 
     const result = await db.query(
       `UPDATE assets SET public_visibility = $3 WHERE user_id = $1 AND id = $2 RETURNING id, public_visibility`,
-      [req.authUser.id, assetId, visibility]
+      [req.authUser.id, assetId, visibility === "categories" ? "category" : visibility]
     );
     if (!result.rows.length) return safeError(res, 404, "Asset wurde nicht gefunden.");
     res.json({ ok: true, asset: result.rows[0] });
