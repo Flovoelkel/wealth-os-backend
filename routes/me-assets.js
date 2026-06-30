@@ -3,7 +3,7 @@ const db = require("../db");
 const { requireAuth } = require("../middleware/auth");
 const { buildGameStateForUser } = require("./game-helpers");
 
-const ME_ASSETS_VERSION = "me-assets-v3.4.6-autosave-dashboard-ux";
+const ME_ASSETS_VERSION = "me-assets-v3.4.7-delete-merge-dashboard-ux";
 
 
 const ALLOWED_GAME_CLASSES = ["productive", "neutral", "commodity", "collector", "immo_self", "immo_rent", "consumer", "business", "crowdfunding", "debt"];
@@ -163,6 +163,21 @@ function safeAssetError(res, err, fallbackMessage) {
   });
 }
 
+
+function normalizeAssetNameKey(value) {
+  return String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+async function findExistingPortfolioAssetByName(userId, name) {
+  const key = normalizeAssetNameKey(name);
+  if (!key) return null;
+  const result = await db.query(
+    `SELECT * FROM assets WHERE user_id = $1 AND mode = 'portfolio' ORDER BY id ASC`,
+    [Number(userId)]
+  );
+  return (result.rows || []).find((row) => normalizeAssetNameKey(row.name) === key) || null;
+}
+
 router.post("/", requireAuth, async (req, res) => {
   try {
     validateNonNegativeNumbers(req.body);
@@ -178,6 +193,29 @@ router.post("/", requireAuth, async (req, res) => {
     const publicVisibility = normalizePublicVisibility(req.body.public_visibility);
     const isLiquid = optionalBoolean(req.body.is_liquid, gameClass === "neutral");
     alternative.assetDetails = { ...(alternative.assetDetails || {}), game_class: gameClass };
+
+    if (mode === "portfolio") {
+      const mergeDuplicate = req.body.merge_duplicate !== false;
+      const existing = mergeDuplicate ? await findExistingPortfolioAssetByName(userId, name) : null;
+      const requestedValue = optionalNumber(req.body.manual_value ?? req.body.value, 0) || 0;
+      if (existing && requestedValue > 0) {
+        const updated = await db.query(
+          `
+          UPDATE assets
+          SET manual_value = COALESCE(manual_value,0) + $3,
+              mode = 'portfolio',
+              asset_game_class = COALESCE(asset_game_class, $4),
+              is_liquid = CASE WHEN COALESCE(asset_game_class, $4) = 'neutral' THEN true ELSE COALESCE(is_liquid,false) END,
+              asset_details = COALESCE(asset_details, '{}'::jsonb) || $5::jsonb
+          WHERE id = $1 AND user_id = $2
+          RETURNING *
+          `,
+          [existing.id, userId, requestedValue, gameClass, JSON.stringify({ last_merged_from_dashboard_at: new Date().toISOString() })]
+        );
+        const gameState = await buildGameStateForUser(req.authUser).catch(() => null);
+        return res.status(200).json({ assets_version: ME_ASSETS_VERSION, ok: true, merged_existing: true, asset: updated.rows[0], game_state: gameState });
+      }
+    }
 
     let dataProvider = parseProvider(req.body.data_provider);
     let symbol = optionalText(req.body.symbol);
@@ -330,6 +368,30 @@ router.post("/:id", requireAuth, async (req, res) => {
     res.json({ assets_version: ME_ASSETS_VERSION, ok: true, asset: result.rows[0], game_state: gameState });
   } catch (err) {
     return safeAssetError(res, err, "Der Wert konnte nicht aktualisiert werden. Bitte prüfe die Eingaben.");
+  }
+});
+
+
+router.delete("/:id", requireAuth, async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: "Ungültige Asset-ID." });
+    const result = await db.query(
+      `
+      UPDATE assets
+      SET mode = 'deleted',
+          public_visibility = 'private',
+          asset_details = COALESCE(asset_details, '{}'::jsonb) || $3::jsonb
+      WHERE user_id = $1 AND id = $2 AND mode IS DISTINCT FROM 'deleted'
+      RETURNING id, name, mode
+      `,
+      [req.authUser.id, id, JSON.stringify({ deleted_by: "portfolio_dashboard", deleted_at: new Date().toISOString() })]
+    );
+    if (!result.rows.length) return res.status(404).json({ error: "Der Wert wurde nicht gefunden oder war bereits gelöscht." });
+    const gameState = await buildGameStateForUser(req.authUser).catch(() => null);
+    res.json({ assets_version: ME_ASSETS_VERSION, ok: true, deleted: result.rows[0], game_state: gameState });
+  } catch (err) {
+    return safeAssetError(res, err, "Der Wert konnte nicht gelöscht werden.");
   }
 });
 
