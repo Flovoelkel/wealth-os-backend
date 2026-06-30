@@ -65,6 +65,71 @@ function isNeutralLiquid(gameClass, body) {
   return gameClass === "neutral";
 }
 
+function normalizeAssetNameKey(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+async function findExistingPortfolioAssetByName(userId, name) {
+  const key = normalizeAssetNameKey(name);
+  if (!key) return null;
+  const result = await db.query(
+    `
+    SELECT *
+    FROM assets
+    WHERE user_id = $1
+      AND mode = 'portfolio'
+    ORDER BY id ASC
+    `,
+    [Number(userId)]
+  );
+  return (result.rows || []).find((row) => normalizeAssetNameKey(row.name) === key) || null;
+}
+
+async function incrementAssetValueForUser(user, existing, amount, fallbackGameClass = "neutral") {
+  const id = Number(existing.id);
+  const value = positiveNumber(amount, 0);
+  if (!id || value <= 0) throw new Error("Betrag muss größer als 0 sein.");
+
+  const currentState = await buildGameStateForUser(user).catch(() => null);
+  const scored = (currentState?.scores?.assets || []).find((item) => Number(item.id) === id);
+  const currentRealValue = Math.abs(toNumber(scored?.real_value, toNumber(existing.manual_value, 0)));
+  const currentQuantity = toNumber(existing.quantity, 0);
+
+  if (["stock", "etf", "crypto"].includes(existing.type) && currentQuantity > 0 && currentRealValue > 0) {
+    const eurPerUnit = currentRealValue / currentQuantity;
+    const additionalQuantity = eurPerUnit > 0 ? value / eurPerUnit : 0;
+    return db.query(
+      `
+      UPDATE assets
+      SET quantity = COALESCE(quantity,0) + $3,
+          mode = 'portfolio',
+          asset_game_class = COALESCE(asset_game_class, 'productive')
+      WHERE id = $1 AND user_id = $2
+      RETURNING *
+      `,
+      [id, user.id, additionalQuantity]
+    );
+  }
+
+  return db.query(
+    `
+    UPDATE assets
+    SET manual_value = COALESCE(manual_value,0) + $3,
+        quantity = COALESCE(NULLIF(quantity,0), 1),
+        mode = 'portfolio',
+        asset_game_class = COALESCE(asset_game_class, $4),
+        is_liquid = CASE WHEN COALESCE(asset_game_class, $4) = 'neutral' THEN true ELSE COALESCE(is_liquid,false) END,
+        asset_details = COALESCE(asset_details, '{}'::jsonb) || $5::jsonb
+    WHERE id = $1 AND user_id = $2
+    RETURNING *
+    `,
+    [id, user.id, value, fallbackGameClass || existing.asset_game_class || "neutral", JSON.stringify({ last_merged_from_wealthlist_at: new Date().toISOString() })]
+  );
+}
+
 
 function currentSeasonKey(date = new Date()) {
   const year = date.getUTCFullYear();
@@ -339,6 +404,20 @@ router.post("/assets", requireAuth, async (req, res) => {
       liquidity_class: isLiquid ? "liquid" : (details.liquidity_class || "illiquid")
     };
 
+    if (mode === "portfolio" && value > 0) {
+      const existing = await findExistingPortfolioAssetByName(req.authUser.id, name);
+      if (existing) {
+        const updated = await incrementAssetValueForUser(req.authUser, existing, value, gameClass);
+        await db.query(
+          `INSERT INTO game_events (user_id, event_type, title, payload, xp_delta, created_at)
+           VALUES ($1,'asset_merged',$2,$3::jsonb,0,NOW())`,
+          [req.authUser.id, "Asset zusammengeführt: " + (existing.name || name), JSON.stringify({ asset_id: existing.id, amount: value, requested_name: name })]
+        ).catch(() => {});
+        const state = await buildGameStateForUser(req.authUser);
+        return res.status(200).json({ ok: true, merged_existing: true, asset: updated.rows[0], game_state: state });
+      }
+    }
+
     const result = await db.query(
       `
       INSERT INTO assets (
@@ -352,7 +431,7 @@ router.post("/assets", requireAuth, async (req, res) => {
     );
 
     const state = await buildGameStateForUser(req.authUser);
-    res.status(201).json({ ok: true, asset: result.rows[0], game_state: state });
+    res.status(201).json({ ok: true, merged_existing: false, asset: result.rows[0], game_state: state });
   } catch (err) {
     console.error(err);
     res.status(400).json({ ok: false, error: "Asset konnte nicht gespeichert werden. Bitte Eingaben prüfen." });
@@ -463,8 +542,28 @@ router.delete("/assets/:id", requireAuth, async (req, res) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isInteger(id)) return safeError(res, 400, "Ungültige Asset-ID.");
-    const result = await db.query("DELETE FROM assets WHERE id = $1 AND user_id = $2 RETURNING id, name", [id, req.authUser.id]);
-    if (!result.rows.length) return safeError(res, 404, "Asset wurde nicht gefunden.");
+
+    // Datenschutz-/Referenz-sicheres Löschen: nicht hart löschen, sondern sofort aus Portfolio/Spiel entfernen.
+    // Dadurch schlagen Löschungen nicht wegen späterer Foreign-Key-Referenzen fehl und verschwinden sofort aus Dashboard und Spiel.
+    const result = await db.query(
+      `
+      UPDATE assets
+      SET mode = 'deleted',
+          public_visibility = 'private',
+          asset_details = COALESCE(asset_details, '{}'::jsonb) || $3::jsonb
+      WHERE id = $1 AND user_id = $2 AND mode IS DISTINCT FROM 'deleted'
+      RETURNING id, name, mode
+      `,
+      [id, req.authUser.id, JSON.stringify({ deleted_by: "wealthlist_game", deleted_at: new Date().toISOString() })]
+    );
+    if (!result.rows.length) return safeError(res, 404, "Asset wurde nicht gefunden oder war bereits gelöscht.");
+
+    await db.query(
+      `INSERT INTO game_events (user_id, event_type, title, payload, xp_delta, created_at)
+       VALUES ($1,'asset_deleted',$2,$3::jsonb,0,NOW())`,
+      [req.authUser.id, "Asset gelöscht: " + (result.rows[0].name || id), JSON.stringify({ asset_id: id })]
+    ).catch(() => {});
+
     const state = await buildGameStateForUser(req.authUser);
     res.json({ ok: true, deleted: result.rows[0], game_state: state });
   } catch (err) {
