@@ -1,16 +1,16 @@
 const db = require("../db");
 const portfolioRoutes = require("./portfolio");
 
-const GAME_VERSION = "game-community-v3.4.4-community-real-opponents";
+const GAME_VERSION = "game-community-v3.4.6-test-feedback-autosave-email";
 
 const GAME_CLASSES = [
-  { key: "productive", label: "Produktiv", emoji: "📈", multiplier: 1.5, portfolio_label: "Depot / Aktien / ETFs / Fonds", is_live_price_supported: true, sort_order: 10 },
+  { key: "productive", label: "Produktiv", emoji: "📈", multiplier: 1.5, portfolio_label: "Depot / ETF / Aktien / Fonds", is_live_price_supported: true, sort_order: 10 },
   { key: "neutral", label: "Neutral / Liquidität", emoji: "💰", multiplier: 1.0, portfolio_label: "Cash / Tagesgeld / Festgeld", is_live_price_supported: false, sort_order: 20 },
   { key: "commodity", label: "Rohstoffe", emoji: "🪙", multiplier: 1.5, portfolio_label: "Gold / Silber / Rohstoffe", is_live_price_supported: false, sort_order: 30 },
   { key: "collector", label: "Sammlerobjekte", emoji: "🏎️", multiplier: 1.0, portfolio_label: "Kunst / Uhren / Sammlerfahrzeuge", is_live_price_supported: false, sort_order: 40 },
   { key: "immo_self", label: "Immobilie selbstgenutzt", emoji: "🏠", multiplier: 0.8, portfolio_label: "Selbstgenutzte Immobilie", is_live_price_supported: false, sort_order: 50 },
   { key: "immo_rent", label: "Immobilie vermietet", emoji: "🏘️", multiplier: 1.5, portfolio_label: "Vermietete Immobilie", is_live_price_supported: false, sort_order: 60 },
-  { key: "consumer", label: "Konsumgut", emoji: "🛍️", multiplier: 0.2, portfolio_label: "Auto / Elektronik / Konsum", is_live_price_supported: false, sort_order: 70 },
+  { key: "consumer", label: "Konsumgut", emoji: "🛍️", multiplier: 0.2, portfolio_label: "Auto / Technik / Konsumgut", is_live_price_supported: false, sort_order: 70 },
   { key: "business", label: "Eigenes Unternehmen", emoji: "🚀", multiplier: 1.5, portfolio_label: "Business / Beteiligung", is_live_price_supported: false, sort_order: 80 },
   { key: "crowdfunding", label: "Crowdfunding", emoji: "🤝", multiplier: 1.0, portfolio_label: "Crowdfunding / Produktbeteiligung", is_live_price_supported: false, sort_order: 90 },
   { key: "debt", label: "Schulden", emoji: "⛔", multiplier: -1.0, portfolio_label: "Kredit / Schulden", is_live_price_supported: false, sort_order: 100 }
@@ -26,6 +26,15 @@ const LEAGUES = [
   { key: "diamond", label: "Diamond", min_value: 1000000, max_value: 10000000, sort_order: 50 },
   { key: "deca_millionaire", label: "10 Mio. €+", min_value: 10000000, max_value: 100000000, sort_order: 60 },
   { key: "centi_millionaire", label: "100 Mio. €+", min_value: 100000000, max_value: null, sort_order: 70 }
+];
+
+const ACHIEVEMENTS = [
+  { key: "first_commodity", title: "Rohstoffsammler", emoji: "🪙", description: "Erster Rohstoff im Portfolio.", test: (scores) => scores.assets.some((a) => a.game_class === "commodity" && a.real_value > 0) },
+  { key: "first_gold", title: "Goldstarter", emoji: "🥇", description: "Erstes Gold-/Rohstoff-Asset angelegt.", test: (scores) => scores.assets.some((a) => a.game_class === "commodity" && /gold|silber|rohstoff/i.test(String(a.name || ""))) },
+  { key: "gold_1000", title: "1.000 € Gold", emoji: "🏅", description: "Gold-/Rohstoffbestand überschreitet 1.000 €.", test: (scores) => scores.assets.filter((a) => a.game_class === "commodity").reduce((s, a) => s + Math.max(0, Number(a.real_value || 0)), 0) >= 1000 },
+  { key: "diversifier_3", title: "Diversifizierer", emoji: "💎", description: "Mindestens 3 Vermögensklassen vorhanden.", test: (scores) => new Set(scores.assets.filter((a) => Math.abs(Number(a.real_value || 0)) > 0).map((a) => a.game_class)).size >= 3 },
+  { key: "liquidity_1000", title: "Liquiditätsprofi", emoji: "🏦", description: "Mehr als 1.000 € liquide Assets.", test: (scores) => scores.assets.filter((a) => a.game_class === "neutral").reduce((s, a) => s + Math.max(0, Number(a.real_value || 0)), 0) >= 1000 },
+  { key: "first_depot", title: "Depotstarter", emoji: "📈", description: "Erstes Aktien-/ETF-/Fonds-Asset.", test: (scores) => scores.assets.some((a) => a.game_class === "productive" && a.real_value > 0) }
 ];
 
 function toNumber(value, fallback = 0) {
@@ -96,6 +105,9 @@ function gameClassFromAsset(asset) {
     return collector ? "collector" : "consumer";
   }
 
+  if (kind === "business") return "business";
+  if (kind === "crowdfunding_project") return "crowdfunding";
+  if (kind === "debt") return "debt";
   if (asset.type === "stock" || asset.type === "etf" || asset.type === "crypto") return "productive";
   return "neutral";
 }
@@ -162,6 +174,7 @@ function calculateScoresFromAssets(assets, activeEvents = []) {
   const portfolioAssets = (assets || []).filter((asset) => asset && asset.mode === "portfolio" && !asset.is_synthetic);
   const assetScores = portfolioAssets.map((asset) => {
     const gameClass = gameClassFromAsset(asset);
+    const def = classDefinition(gameClass);
     const real_value = realValueForAsset(asset);
     const weighted_value = weightedValueForAsset(asset);
     const market_value = marketValueForAsset(asset, activeEvents);
@@ -170,8 +183,10 @@ function calculateScoresFromAssets(assets, activeEvents = []) {
       name: asset.name,
       type: asset.type,
       game_class: gameClass,
-      game_class_label: classDefinition(gameClass).label,
-      game_multiplier: classDefinition(gameClass).multiplier,
+      game_class_label: def.label,
+      game_class_portfolio_label: def.portfolio_label,
+      game_multiplier: def.multiplier,
+      is_liquid: asset.is_liquid === true || gameClass === "neutral",
       real_value: round(real_value, 2),
       weighted_value: round(weighted_value, 2),
       market_value: round(market_value, 2)
@@ -222,6 +237,37 @@ async function ensurePublicSettings(userId) {
   return result.rows[0];
 }
 
+async function awardAchievements(userId, scores) {
+  const awarded = [];
+  for (const achievement of ACHIEVEMENTS) {
+    let ok = false;
+    try { ok = achievement.test(scores); } catch (_) { ok = false; }
+    if (!ok) continue;
+    try {
+      const result = await db.query(
+        `
+        INSERT INTO game_achievements (user_id, achievement_key, title, description, icon, unlocked_at, created_at)
+        VALUES ($1,$2,$3,$4,$5,NOW(),NOW())
+        ON CONFLICT (user_id, achievement_key) DO NOTHING
+        RETURNING *
+        `,
+        [userId, achievement.key, achievement.title, achievement.description, achievement.emoji]
+      );
+      if (result.rows[0]) awarded.push(result.rows[0]);
+    } catch (_) {
+      // Older schemas may not yet have all achievement columns. Do not block autosave.
+      try {
+        const result = await db.query(
+          `INSERT INTO game_achievements (user_id, achievement_key, unlocked_at) VALUES ($1,$2,NOW()) ON CONFLICT (user_id, achievement_key) DO NOTHING RETURNING *`,
+          [userId, achievement.key]
+        );
+        if (result.rows[0]) awarded.push(result.rows[0]);
+      } catch (_) {}
+    }
+  }
+  return awarded;
+}
+
 async function buildGameStateForUser(user) {
   const userId = Number(user.id || user.user_id || user);
   const profile = await ensureGameProfile(user);
@@ -244,11 +290,14 @@ async function buildGameStateForUser(user) {
     [userId, scores.real_wealth, scores.weighted_wealth, scores.market_wealth, scores.league.key]
   );
 
+  const newAchievements = await awardAchievements(userId, scores);
+
   return {
     game_version: GAME_VERSION,
     profile: updated.rows[0] || profile,
     public_settings: publicSettings,
     scores,
+    new_achievements: newAchievements,
     portfolio_summary: {
       total_value: portfolio.total_value,
       total_day_change_value: portfolio.total_day_change_value,
@@ -307,30 +356,6 @@ function publicProfileRow(row) {
   };
 }
 
-function sanitizePublicAsset(asset, settings) {
-  const visibility = asset.public_visibility || "private";
-  const hiddenIds = parseJsonArray(settings.hidden_asset_ids).map(String);
-  if (visibility === "private" || hiddenIds.includes(String(asset.id))) return null;
-
-  const mode = settings.asset_visibility_mode || "categories";
-  const gameClass = gameClassFromAsset(asset);
-  const realValue = realValueForAsset(asset);
-  const showExact = settings.show_exact_values === true;
-
-  return {
-    id: asset.id,
-    name: mode === "categories" ? classDefinition(gameClass).portfolio_label : asset.name,
-    type: asset.type,
-    game_class: gameClass,
-    game_class_label: classDefinition(gameClass).label,
-    value: mode === "categories" ? null : showExact ? round(realValue, 2) : roundToPublicBucket(realValue),
-    value_display_mode: mode === "categories" ? "category_only" : showExact ? "exact" : "rounded",
-    asset_group: asset.asset_group || null,
-    asset_class: asset.asset_class || null,
-    region: asset.region || null
-  };
-}
-
 function roundToPublicBucket(value) {
   const n = Math.abs(toNumber(value, 0));
   const sign = value < 0 ? -1 : 1;
@@ -339,6 +364,41 @@ function roundToPublicBucket(value) {
   else if (n >= 100000) bucket = 10000;
   else if (n >= 10000) bucket = 5000;
   return sign * Math.round(n / bucket) * bucket;
+}
+
+function publicValue(value, settings) {
+  return settings.show_exact_values === true ? round(value, 2) : roundToPublicBucket(value);
+}
+
+function hiddenIdSet(settings) {
+  return new Set(parseJsonArray(settings.hidden_asset_ids).map(String));
+}
+
+function assetAllowedByVisibility(asset, settings) {
+  const hidden = hiddenIdSet(settings);
+  if (hidden.has(String(asset.id))) return false;
+  const mode = settings.asset_visibility_mode || "categories";
+  if (mode === "custom") return ["public", "category", "category_only"].includes(asset.public_visibility || "private");
+  return true;
+}
+
+function sanitizePublicAsset(asset, settings) {
+  if (!assetAllowedByVisibility(asset, settings)) return null;
+  const gameClass = gameClassFromAsset(asset);
+  const realValue = realValueForAsset(asset);
+  return {
+    id: asset.id,
+    name: asset.name,
+    type: asset.type,
+    category_label: classDefinition(gameClass).portfolio_label,
+    game_class: gameClass,
+    game_class_label: classDefinition(gameClass).label,
+    value: publicValue(realValue, settings),
+    value_display_mode: settings.show_exact_values === true ? "exact" : "rounded",
+    asset_group: asset.asset_group || null,
+    asset_class: asset.asset_class || null,
+    region: asset.region || null
+  };
 }
 
 async function buildPublicPortfolio(userId) {
@@ -350,15 +410,16 @@ async function buildPublicPortfolio(userId) {
   }
 
   const portfolio = await portfolioRoutes.buildPortfolioResponse(userId);
-  const assets = (portfolio.portfolio?.assets || [])
+  const mode = settings.asset_visibility_mode || "categories";
+  const publicSourceAssets = (portfolio.portfolio?.assets || [])
     .filter((asset) => !asset.is_synthetic)
-    .map((asset) => sanitizePublicAsset(asset, settings))
-    .filter(Boolean);
+    .filter((asset) => assetAllowedByVisibility(asset, settings));
 
   const categories = new Map();
-  for (const asset of (portfolio.portfolio?.assets || []).filter((item) => !item.is_synthetic)) {
+  for (const asset of publicSourceAssets) {
     const gameClass = gameClassFromAsset(asset);
-    const current = categories.get(gameClass) || { game_class: gameClass, label: classDefinition(gameClass).label, value: 0, count: 0 };
+    const def = classDefinition(gameClass);
+    const current = categories.get(gameClass) || { game_class: gameClass, label: def.portfolio_label, value: 0, count: 0 };
     current.value += realValueForAsset(asset);
     current.count += 1;
     categories.set(gameClass, current);
@@ -368,12 +429,12 @@ async function buildPublicPortfolio(userId) {
     user_id: Number(userId),
     visibility: {
       public_enabled: settings.public_enabled === true,
-      asset_visibility_mode: settings.asset_visibility_mode || "categories",
+      asset_visibility_mode: mode,
       show_exact_values: settings.show_exact_values === true
     },
-    total_value: settings.show_exact_values === true ? portfolio.total_value : roundToPublicBucket(portfolio.total_value),
-    categories: Array.from(categories.values()).map((item) => ({ ...item, value: settings.show_exact_values === true ? round(item.value, 2) : roundToPublicBucket(item.value) })),
-    assets: settings.asset_visibility_mode === "categories" ? [] : assets
+    total_value: publicValue(publicSourceAssets.reduce((sum, asset) => sum + realValueForAsset(asset), 0), settings),
+    categories: Array.from(categories.values()).map((item) => ({ ...item, value: publicValue(item.value, settings) })),
+    assets: mode === "categories" ? [] : publicSourceAssets.map((asset) => sanitizePublicAsset(asset, settings)).filter(Boolean)
   };
 }
 
@@ -385,6 +446,7 @@ module.exports = {
   GAME_VERSION,
   GAME_CLASSES,
   LEAGUES,
+  ACHIEVEMENTS,
   classDefinition,
   cleanText,
   parseJsonObject,
