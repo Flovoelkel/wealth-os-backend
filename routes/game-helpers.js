@@ -1,10 +1,10 @@
 const db = require("../db");
 const portfolioRoutes = require("./portfolio");
 
-const GAME_VERSION = "game-community-v3.4.6-test-feedback-autosave-email";
+const GAME_VERSION = "game-community-v3.4.7-delete-merge-dashboard-ux";
 
 const GAME_CLASSES = [
-  { key: "productive", label: "Produktiv", emoji: "📈", multiplier: 1.5, portfolio_label: "Depot / ETF / Aktien / Fonds", is_live_price_supported: true, sort_order: 10 },
+  { key: "productive", label: "Geldanlage", emoji: "📈", multiplier: 1.5, portfolio_label: "Aktie / ETF / Krypto / Fonds", is_live_price_supported: true, sort_order: 10 },
   { key: "neutral", label: "Neutral / Liquidität", emoji: "💰", multiplier: 1.0, portfolio_label: "Cash / Tagesgeld / Festgeld", is_live_price_supported: false, sort_order: 20 },
   { key: "commodity", label: "Rohstoffe", emoji: "🪙", multiplier: 1.5, portfolio_label: "Gold / Silber / Rohstoffe", is_live_price_supported: false, sort_order: 30 },
   { key: "collector", label: "Sammlerobjekte", emoji: "🏎️", multiplier: 1.0, portfolio_label: "Kunst / Uhren / Sammlerfahrzeuge", is_live_price_supported: false, sort_order: 40 },
