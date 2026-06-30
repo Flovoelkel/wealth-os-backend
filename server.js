@@ -63,7 +63,7 @@ app.use("/api/portfolio-snapshots", portfolioSnapshotsRoutes);
 app.use("/api/assets/search", assetSymbolSearchRoutes);
 
 app.get("/", (req, res) => {
-  res.json({ status: "wealth-os online", version: "v3.4.5-crowdfunding-projects" });
+  res.json({ status: "wealth-os online", version: "v3.4.6-test-feedback-autosave-email" });
 });
 
 const PORT = process.env.PORT || 3000;
