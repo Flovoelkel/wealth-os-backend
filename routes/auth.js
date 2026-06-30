@@ -3,7 +3,7 @@ const bcrypt = require("bcryptjs");
 const db = require("../db");
 const { requireAuth, signUserToken } = require("../middleware/auth");
 
-const AUTH_VERSION = "auth-v3.0.1-multi-user-password-8";
+const AUTH_VERSION = "auth-v3.4.6-public-signup";
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 function cleanEmail(value) {
@@ -41,22 +41,23 @@ function requireAdminTokenFromBody(req) {
 }
 
 function requireSignupCode(req) {
+  const publicSignupEnabled = String(process.env.ALLOW_PUBLIC_PORTFOLIO_SIGNUP || "").toLowerCase() === "true";
+  if (publicSignupEnabled) return;
+
   const expectedCode = process.env.PORTFOLIO_SIGNUP_CODE;
 
-  // If no signup code is configured, public signup is disabled unless explicitly enabled.
-  if (!expectedCode && process.env.ALLOW_PUBLIC_PORTFOLIO_SIGNUP !== "true") {
-    const err = new Error("Registrierung ist noch nicht freigeschaltet. Setze PORTFOLIO_SIGNUP_CODE in Render.");
+  // Closed signup remains possible when public signup is disabled.
+  if (!expectedCode) {
+    const err = new Error("Registrierung ist noch nicht freigeschaltet. Setze ALLOW_PUBLIC_PORTFOLIO_SIGNUP=true oder PORTFOLIO_SIGNUP_CODE in Render.");
     err.statusCode = 403;
     throw err;
   }
 
-  if (expectedCode) {
-    const providedCode = req.body?.signup_code || req.query.signup_code || req.headers["x-signup-code"];
-    if (providedCode !== expectedCode) {
-      const err = new Error("Ungültiger Registrierungscode.");
-      err.statusCode = 401;
-      throw err;
-    }
+  const providedCode = req.body?.signup_code || req.query.signup_code || req.headers["x-signup-code"];
+  if (providedCode !== expectedCode) {
+    const err = new Error("Ungültiger Registrierungscode.");
+    err.statusCode = 401;
+    throw err;
   }
 }
 
